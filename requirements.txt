@@ -1,0 +1,5 @@
+python-telegram-bot==21.10
+APScheduler==3.10.4
+openai==1.82.0
+python-dotenv==1.1.0
+aiosqlite==0.21.0
