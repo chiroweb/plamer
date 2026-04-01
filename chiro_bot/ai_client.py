@@ -1,10 +1,15 @@
-"""AI API 연동 모듈 — 인텐트 파싱 + 메시지 생성
-페르소나 명세서 기반 전면 리빌드"""
+"""AI 엔진 — Function Calling 기반 자율 판단 구조.
+AI가 대화를 보고 스스로 판단해서 도구를 호출하고, 자연스럽게 응답한다.
+하드코딩된 인텐트 라우팅 없음."""
 from __future__ import annotations
 
 import json
+import logging
 from openai import AsyncOpenAI
 from chiro_bot.config import AI_API_KEY, AI_BASE_URL, AI_MODEL
+from chiro_bot.tools import TOOL_SCHEMAS, execute_tool
+
+logger = logging.getLogger(__name__)
 
 _client = None
 _pattern_cache: str = ""
@@ -19,7 +24,6 @@ def _get_client() -> AsyncOpenAI:
 
 
 async def _get_pattern_context() -> str:
-    """패턴 요약을 캐시해서 반환 (5분 캐시)"""
     global _pattern_cache, _pattern_cache_time
     import time
     now = time.time()
@@ -34,150 +38,116 @@ async def _get_pattern_context() -> str:
     return _pattern_cache
 
 
-# ============================================================
-# 페르소나 시스템 프롬프트 (명세서 기반)
-# ============================================================
-
-SYSTEM_PROMPT = """너는 CHIRO의 개인 비서 봇이야.
+SYSTEM_PROMPT = """너는 CHIRO의 개인 비서야. 유저의 일정 관리 파트너.
 
 ## 정체성
 - 역할: 개인 비서 겸 코치. 상사가 아니라 파트너.
 - 핵심 믿음: "당신은 할 수 있는 사람이에요. 저는 그걸 까먹지 않게 옆에 있는 거예요."
-- 관계: "우리" — 관찰자가 아니라 같이 하는 사람. "우리 오늘 이거 해야 해요", "우리 지금 어디까지 왔어요?"
-- 자기 인식: 봇이라는 사실을 숨기지 않음. "저는 강요할 수 없어요. 선택은 당신 거예요."
+- "우리" 프레이밍: "우리 오늘 이거 해야 해요", "우리 지금 어디까지 왔어요?"
+- 봇이라는 사실을 숨기지 않음.
 
-## 말투 규칙
-- "~해요" 체 (해요체). 합쇼체("~합니다") 아님.
-- 존댓말 베이스에 살짝 친근함.
-- 문장은 짧게. 한 메시지 최대 3줄. 장문 금지.
-- 이모지 최소한: ✅ ❌ 🔄 ☀️ 💡 정도만. 🎉 👍 🔥 같은 과잉 이모지 금지.
-- 어떤 상황에서도 반말로 전환하지 않음.
+## 말투
+- "~해요" 체 (해요체). 존댓말 베이스에 살짝 친근함.
+- 문장은 짧게. 한 메시지 최대 3줄.
+- 이모지 최소한: ✅ ❌ 🔄 💡 정도만.
+- 어떤 상황에서도 반말 전환 안 함.
 
 ## 절대 금지
-- 명령형: "하세요", "해", "시작하세요" → "할 수 있어요?", "시작해볼까요?"로 대체
-- 비난/조롱: "또 못했네", "매번 이러면..."
-- 빈 칭찬: "잘하고 있어!", "대단해요!", "화이팅!" → 수치/팩트 기반 피드백으로 대체
-- 죄책감 유발: "실망이에요", "약속했잖아요"
-- 비교: "어제는 잘했는데...", "다른 사람들은..."
-- 과잉 공감: "정말 힘드시죠...", "많이 지쳤겠어요..."
-- 방어적 반응: "저도 당신을 위해서..."
-- 불필요한 사과: "죄송해요" (잘못한 게 없으므로)
+- 명령형 ("하세요") → "할 수 있어요?"로
+- 빈 칭찬 ("잘했어요!", "대단해요!") → 수치/팩트 피드백으로
+- 비난/죄책감/비교
+- 과잉 공감, 방어적 반응, 불필요한 사과
 
-## 필수 원칙
-1. "우리" 프레이밍 유지: "우리 10시에 하기로 했죠?"
-2. 질문형으로 행동 유도: "시작하세요" ❌ → "시작할 수 있어요?" ✅
-3. 수치/사실 기반 피드백: "잘했어요" ❌ → "예상 2시간에 1시간 50분이면 빠르네요" ✅
-4. 칭찬 시 구체적 근거: "대단해요" ❌ → "중간에 끊겼지만 결국 끝냈어요" ✅
-5. 선택지 제시: "해야 해요" ❌ → "지금 하거나, 내일로 넘기거나. 어떻게 하고 싶어요?" ✅
-6. 질문은 한 번에 하나만.
-7. 모호한 답변 시 재질문: "좀 이따" → "몇 시쯤이요? 대충이라도 괜찮아요."
-8. 유저가 짜증내면 감정 인정 + 선택지 전환. 방어/사과 금지.
-9. 유저가 쉬겠다고 하면 존중. 강요 금지.
+## 행동 원칙
+- 유저가 말한 내용을 보고, 필요한 도구(함수)가 있으면 호출해.
+- 도구 호출 결과를 보고 자연스럽게 응답해.
+- 도구가 필요 없는 일반 대화면 그냥 대화해.
+- 정보가 부족하면 재질문. 질문은 한 번에 하나만.
+- 유저가 루틴/스케줄/시간표를 말하면 → add_routines로 저장.
+- 유저가 할 일을 말하면 → add_task로 저장.
+- 유저가 쉬겠다고 하면 → 존중. 강요 금지.
+- 유저가 짜증내면 → 감정 인정 + 선택지 제시.
 
-## 에스컬레이션 톤 4단계 (미응답 시)
-1단계 (30분 후) — 부드러운 재알림: "혹시 메시지 못 보셨나요?"
-2단계 (20분 후) — 살짝 직접적: "아직 답이 없네요. 지금 잠깐만 시간 내줄 수 있어요?"
-3단계 (10분 후) — 팩트 압박: 수치와 마감을 직접 제시. 감정이 아닌 사실로.
-4단계 (5분 후) — 단호한 직구: "솔직히 말할게요. 지금 4번째 알림이에요." 그래도 존댓말 유지.
-→ 유저 응답 시 즉시 1단계로 복귀.
+## 에스컬레이션 (미응답 시)
+1단계: "혹시 메시지 못 보셨나요?"
+2단계: "아직 답이 없네요. 잠깐만 시간 내줄 수 있어요?"
+3단계: 수치와 마감으로 팩트 압박.
+4단계: "솔직히 말할게요. 4번째 알림이에요."
+→ 유저 응답 시 즉시 1단계 복귀.
 
-## 톤 판단 매트릭스
-- 에스컬레이션 0 + 마감 여유 → 1단계 (부드러운)
-- 에스컬레이션 1~2 → 2단계 (직접적)
-- 에스컬레이션 3+ 또는 마감 임박 → 3단계 (팩트 압박)
-- 에스컬레이션 4+ 또는 마감 < 소요시간 → 4단계 (단호한 직구)
-- 미룸 3회+ → 3단계 이상 강제
-- 못함 3회+ → 태스크 분해 제안 모드
-- 유저 감정 표출 → 감정 인정 + 선택지 (톤 1~2단계로 낮춤)
-- 완료 → 1단계 (수치 피드백)
-- 주말/쉬는 날 → 1단계 (가볍게)"""
+## 도구 사용 판단
+너에게는 여러 도구가 주어져 있어. 유저 메시지를 보고 스스로 판단해서 필요한 도구를 호출해.
+- 여러 도구를 연속으로 호출해도 돼.
+- 도구 호출이 필요 없으면 호출하지 않아도 돼.
+- 도구 결과를 보고 유저에게 자연스럽게 응답해."""
 
 
-INTENT_SYSTEM = """유저의 메시지를 분석해서 인텐트를 JSON으로 반환해.
-가능한 인텐트:
-- task_add: 새 태스크 추가 요청 (할 일 언급)
-- task_done: 태스크 완료 보고 (끝났어, 완료, 다 했어, 끝)
-- task_defer: 태스크 미루기/연기 (나중에, 미룰래, 좀 있다가, 이따가)
-- task_fail: 태스크 못함 (못하겠어, 포기, 안 되겠어)
-- task_partial: 부분 완료 (절반 했어, 좀 했어, 반 했어)
-- task_status: 진행 상태 질문/응답 (어디까지 했어, 하고 있어)
-- dnd_add: 방해금지 시간 추가 (수업 중, DND, 바빠)
-- idea_capture: 아이디어 메모 (아이디어, 생각, 메모)
-- plan_confirm: 플랜 확인/수락 (ㅇㅇ, 좋아, 확인, ㄱㄱ, 그래, 응)
-- plan_modify: 플랜 수정 요청 (바꿔, 수정, 다시)
-- urgent_add: 긴급 일정 삽입 (급해, 긴급, 갑자기)
-- rest_request: 쉬겠다는 요청 (쉴래, 오늘 안 해, 패스)
-- general: 일반 대화
-- unclear: 의도 불분명 (재질문 필요)
-
-JSON 형식: {"intent": "...", "data": {...}}
-data에는 파싱된 정보를 넣어:
-- task_add: {"title": "...", "category": "...", "deadline": "...", "estimated_minutes": N}
-- dnd_add: {"start_time": "HH:MM", "end_time": "HH:MM", "reason": "..."}
-- urgent_add: {"title": "...", "deadline": "...", "estimated_minutes": N}
-- idea_capture: {"content": "..."}
-- task_done/defer/fail/partial: {"title": "..."} (어떤 태스크인지 힌트)
-
-반드시 유효한 JSON만 반환해. 다른 텍스트 금지."""
-
-
-async def parse_intent(user_message: str, context: str = "") -> dict:
-    """유저 메시지에서 인텐트 파싱"""
+async def chat(user_message: str, conversation_history: list = None) -> tuple:
+    """
+    메인 대화 함수. AI가 자율적으로 판단해서 도구를 호출하고 응답.
+    반환: (응답 텍스트, 호출된 도구 목록)
+    """
     client = _get_client()
 
-    messages = [
-        {"role": "system", "content": INTENT_SYSTEM},
-    ]
-    if context:
-        messages.append({"role": "system", "content": f"현재 대화 컨텍스트:\n{context}"})
-    messages.append({"role": "user", "content": user_message})
-
-    try:
-        response = await client.chat.completions.create(
-            model=AI_MODEL,
-            messages=messages,
-            temperature=0.1,
-            max_tokens=500,
-        )
-        text = response.choices[0].message.content.strip()
-        if "```" in text:
-            text = text.split("```")[1]
-            if text.startswith("json"):
-                text = text[4:]
-            text = text.strip()
-        return json.loads(text)
-    except Exception as e:
-        return {"intent": "general", "data": {}, "error": str(e)}
-
-
-async def generate_response(prompt: str, context_messages: list = None,
-                            pattern_context: bool = True) -> str:
-    """봇 응답 생성 — 페르소나 + 패턴 데이터 주입"""
-    client = _get_client()
-
+    # 시스템 프롬프트 구성
     system = SYSTEM_PROMPT
-    if pattern_context:
-        patterns = await _get_pattern_context()
-        if patterns and patterns != "아직 축적된 패턴 데이터가 없음.":
-            system += f"\n\n## 유저의 행동 패턴 (데이터 기반)\n{patterns}\n이 데이터를 참고해서 분석 모드 톤으로 활용해."
+    patterns = await _get_pattern_context()
+    if patterns and patterns != "아직 축적된 패턴 데이터가 없음.":
+        system += f"\n\n## 유저 행동 패턴 데이터\n{patterns}"
 
+    # 대화 히스토리 구성
     messages = [{"role": "system", "content": system}]
-    if context_messages:
-        for m in context_messages[-10:]:
+    if conversation_history:
+        for m in conversation_history[-15:]:
             role = "assistant" if m.get("direction") == "bot" else "user"
             messages.append({"role": role, "content": m["content"]})
-    messages.append({"role": "user", "content": prompt})
+    messages.append({"role": "user", "content": user_message})
 
-    try:
-        response = await client.chat.completions.create(
-            model=AI_MODEL,
-            messages=messages,
-            temperature=0.7,
-            max_tokens=300,
-        )
-        return response.choices[0].message.content.strip()
-    except Exception as e:
-        return f"(AI 응답 생성 실패: {e})"
+    called_tools = []
+
+    # 최대 5회 도구 호출 루프 (AI가 도구를 여러 번 호출할 수 있음)
+    for _ in range(5):
+        try:
+            response = await client.chat.completions.create(
+                model=AI_MODEL,
+                messages=messages,
+                tools=TOOL_SCHEMAS,
+                tool_choice="auto",
+                temperature=0.7,
+                max_tokens=500,
+            )
+        except Exception as e:
+            logger.error(f"AI 호출 실패: {e}")
+            return f"(AI 응답 생성 실패: {e})", []
+
+        msg = response.choices[0].message
+
+        # 도구 호출이 없으면 → 최종 응답
+        if not msg.tool_calls:
+            return msg.content or "", called_tools
+
+        # 도구 호출 실행
+        messages.append(msg)  # assistant message with tool_calls
+
+        for tool_call in msg.tool_calls:
+            fn_name = tool_call.function.name
+            try:
+                fn_args = json.loads(tool_call.function.arguments)
+            except json.JSONDecodeError:
+                fn_args = {}
+
+            logger.info(f"도구 호출: {fn_name}({fn_args})")
+            result = await execute_tool(fn_name, fn_args)
+            called_tools.append({"name": fn_name, "args": fn_args, "result": result})
+
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "content": result,
+            })
+
+    # 루프 초과 (안전장치)
+    return "잠시 처리 중이에요. 다시 말씀해주세요.", called_tools
 
 
 async def generate_proactive_message(
@@ -186,7 +156,10 @@ async def generate_proactive_message(
     plan: list = None,
     recent_messages: list = None
 ) -> str:
-    """프로액티브 메시지 생성 (봇이 먼저 보내는 메시지)"""
+    """프로액티브 메시지 생성 (도구 호출 없이 응답만)"""
+    client = _get_client()
+
+    system = SYSTEM_PROMPT
     context = f"상황: {situation}\n"
     if tasks:
         context += "오늘 태스크:\n" + "\n".join(
@@ -199,11 +172,20 @@ async def generate_proactive_message(
             for p in plan
         ) + "\n"
 
-    prompt = f"""{context}
-위 상황에 맞는 메시지를 보내줘.
-- 해요체. "우리" 프레이밍.
-- 한 메시지 3줄 이내.
-- 에스컬레이션 단계에 맞는 톤.
-- 명령형 금지. 질문형으로 유도."""
+    messages = [{"role": "system", "content": system}]
+    if recent_messages:
+        for m in recent_messages[-10:]:
+            role = "assistant" if m.get("direction") == "bot" else "user"
+            messages.append({"role": role, "content": m["content"]})
+    messages.append({"role": "user", "content": f"{context}\n위 상황에 맞는 메시지를 보내줘. 3줄 이내."})
 
-    return await generate_response(prompt, recent_messages)
+    try:
+        response = await client.chat.completions.create(
+            model=AI_MODEL,
+            messages=messages,
+            temperature=0.7,
+            max_tokens=300,
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        return f"(AI 응답 생성 실패: {e})"

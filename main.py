@@ -15,7 +15,7 @@ from chiro_bot.config import TELEGRAM_BOT_TOKEN, PROACTIVE_INTERVAL_MINUTES, TIM
 from chiro_bot.database import init_db, get_today_tasks, get_today_plan, get_today_dnd, get_task_stats_today
 from chiro_bot.handlers import (
     handle_message, start_plan_flow,
-    cmd_ideas, cmd_routines, cmd_add_routine, cmd_add_dnd_default, cmd_patterns,
+    cmd_ideas, cmd_routines, cmd_patterns,
 )
 from chiro_bot.proactive import proactive_check
 
@@ -158,8 +158,6 @@ def main():
     app.add_handler(CommandHandler("dnd", cmd_dnd))
     app.add_handler(CommandHandler("ideas", cmd_ideas))
     app.add_handler(CommandHandler("routines", cmd_routines))
-    app.add_handler(CommandHandler("add_routine", cmd_add_routine))
-    app.add_handler(CommandHandler("add_dnd", cmd_add_dnd_default))
     app.add_handler(CommandHandler("patterns", cmd_patterns))
     app.add_handler(CommandHandler("help", cmd_help))
 
