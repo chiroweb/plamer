@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from openai import AsyncOpenAI
 from chiro_bot.config import AI_API_KEY, AI_BASE_URL, AI_MODEL
 from chiro_bot.tools import TOOL_SCHEMAS, execute_tool
@@ -83,11 +85,99 @@ SYSTEM_PROMPT = """너는 CHIRO의 개인 비서야. 유저의 일정 관리 파
 - 컨디션이 안 좋아도 운동은 부드럽게 제안: "그래도 가벼운 산책이라도 어때요? 도저히 못하겠어요?"
 - 데이터가 쌓이면 패턴 분석 가능: "보통 수요일 오후에 에너지가 떨어지더라고요."
 
-## 도구 사용 판단
+## 판단력 가이드라인
+너는 똑똑한 비서야. 다음을 항상 스스로 판단해:
+
+### 시간 인식
+- 현재 시각과 요일을 항상 인식해. 시스템이 매 대화마다 알려줌.
+- 유저의 루틴을 확인해서 지금 뭐 하는 시간인지 파악해.
+- 업무 중이면 업무 방해 최소화. 퇴근 후면 개인 태스크 제안 가능.
+
+### 날짜별 태스크 구분
+- 오늘 할 일과 내일 할 일을 절대 섞지 마.
+- "내일"이라고 유저가 말했으면 오늘 플랜에 넣지 마.
+- 태스크를 제안할 때 항상 날짜를 명시해.
+
+### 우선순위 판단
+- 마감이 빠른 것 먼저. 시간순으로 정렬해서 생각해.
+- 10:35 양치 vs 16:50 신분증 → 당연히 양치 먼저.
+- 상식적으로 판단해. 코드가 시키는 대로가 아니라 비서라면 어떻게 할지 생각해.
+
+### 준비물/전제조건 확인
+- 태스크를 등록할 때 "준비할 거 있어요?" 물어봐.
+- 신분증 재발급 → "사진 필요하지 않아요?", "뭐 가져가야 해요?"
+- 이런 질문은 비서로서 당연히 해야 할 질문이야.
+
+### 스케줄 조정 제안
+- 유저가 일정을 말하면, 기존 루틴과 충돌하는지 확인해.
+- 충돌하면 알려줘: "그 시간에 업무 중이신데, 괜찮아요?"
+
+## 도구 사용
 너에게는 여러 도구가 주어져 있어. 유저 메시지를 보고 스스로 판단해서 필요한 도구를 호출해.
 - 여러 도구를 연속으로 호출해도 돼.
 - 도구 호출이 필요 없으면 호출하지 않아도 돼.
 - 도구 결과를 보고 유저에게 자연스럽게 응답해."""
+
+
+async def _build_context() -> str:
+    """매 대화마다 AI에게 주입할 현재 상황 컨텍스트"""
+    from chiro_bot import database as db
+    from chiro_bot.config import TIMEZONE
+    now = datetime.now(ZoneInfo(TIMEZONE))
+    dow_names = ["월", "화", "수", "목", "금", "토", "일"]
+
+    ctx_parts = [
+        f"## 현재 상황",
+        f"- 현재 시각: {now.strftime('%Y-%m-%d %H:%M')} ({dow_names[now.weekday()]}요일)",
+    ]
+
+    # 오늘 루틴
+    routines = await db.get_today_routines()
+    if routines:
+        current_routine = None
+        for r in routines:
+            if r["start_time"] <= now.strftime("%H:%M") <= r["end_time"]:
+                current_routine = r
+                break
+        if current_routine:
+            ctx_parts.append(f"- 유저 현재 상태: {current_routine['label']} 중 ({current_routine['start_time']}~{current_routine['end_time']})")
+        ctx_parts.append("- 오늘 루틴: " + ", ".join(
+            f"{r['start_time']}~{r['end_time']} {r['label']}" for r in routines
+        ))
+
+    # 오늘 태스크 (날짜별 구분)
+    tasks = await db.get_today_tasks()
+    if tasks:
+        today_str = now.strftime("%Y-%m-%d")
+        today_tasks = []
+        other_tasks = []
+        for t in tasks:
+            dl = t.get("deadline", "")
+            if dl and not dl.startswith(today_str) and len(dl) > 5:
+                other_tasks.append(t)
+            else:
+                today_tasks.append(t)
+        if today_tasks:
+            ctx_parts.append("- 오늘 태스크: " + ", ".join(
+                f"{t['title']}({t.get('deadline','시간미정')}, {t['status']})" for t in today_tasks
+            ))
+        if other_tasks:
+            ctx_parts.append("- 다른 날 태스크: " + ", ".join(
+                f"{t['title']}({t.get('deadline','미정')})" for t in other_tasks
+            ))
+
+    # 오늘 DND
+    dnd = await db.get_today_dnd()
+    if dnd:
+        ctx_parts.append("- DND: " + ", ".join(f"{d['start_time']}~{d['end_time']}" for d in dnd))
+
+    # 오늘 컨디션
+    conditions = await db.get_today_conditions()
+    if conditions:
+        last = conditions[-1]
+        ctx_parts.append(f"- 마지막 컨디션: 에너지 {last.get('energy_level','?')}/5, 기분: {last.get('mood','?')} ({last.get('time','')})")
+
+    return "\n".join(ctx_parts)
 
 
 async def chat(user_message: str, conversation_history: list = None) -> tuple:
@@ -97,8 +187,11 @@ async def chat(user_message: str, conversation_history: list = None) -> tuple:
     """
     client = _get_client()
 
-    # 시스템 프롬프트 구성
+    # 시스템 프롬프트 + 현재 상황 컨텍스트
     system = SYSTEM_PROMPT
+    context = await _build_context()
+    system += f"\n\n{context}"
+
     patterns = await _get_pattern_context()
     if patterns and patterns != "아직 축적된 패턴 데이터가 없음.":
         system += f"\n\n## 유저 행동 패턴 데이터\n{patterns}"
