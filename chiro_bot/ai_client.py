@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 
 from openai import AsyncOpenAI
 
-from chiro_bot.config import AI_API_KEY, AI_BASE_URL, AI_MODEL
+from chiro_bot.config import AI_API_KEY, AI_BASE_URL, AI_MODEL, TIMEZONE
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +45,12 @@ INTENT_PARSE_PROMPT = """너는 JSON 변환기야. 유저 메시지를 읽고, �
 - emergency: 긴급 일정 {{"intent": "emergency", "title": "...", "duration_minutes": ...}}
 - chat: 일반 대화 {{"intent": "chat", "topic": "..."}}
 - unclear: 판단 불가 {{"intent": "unclear"}}
+
+중요 규칙:
+- "오늘"은 {today} 이다. "내일"은 {tomorrow} 이다. 날짜를 YYYY-MM-DD HH:MM 형식으로 반환해.
+- "4시 50분"은 "16:50"이다. 12시간제를 24시간제로 변환해.
+- deadline에 날짜 없이 시간만 말하면 오늘 날짜를 붙여: "{today} HH:MM"
+- "내일"이면 "{tomorrow} HH:MM"
 
 현재 대화 상태: {current_state}
 마지막 봇 질문: {last_bot_question}
@@ -192,9 +198,16 @@ async def parse_intent(
     """유저 메시지 → 구조화된 인텐트 JSON. AI는 판단만, 응답 생성 안 함."""
     client = _get_client()
 
+    from datetime import timedelta as _td
+    now = datetime.now(ZoneInfo(TIMEZONE))
+    today_str = now.strftime("%Y-%m-%d")
+    tomorrow_str = (now + _td(days=1)).strftime("%Y-%m-%d")
+
     prompt = INTENT_PARSE_PROMPT.format(
         current_state=current_state or "없음",
         last_bot_question=last_bot_question or "없음",
+        today=today_str,
+        tomorrow=tomorrow_str,
     )
 
     messages = [
