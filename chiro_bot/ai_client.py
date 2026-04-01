@@ -164,14 +164,27 @@ async def generate_proactive_message(
     plan: list = None,
     recent_messages: list = None
 ) -> str:
-    """프로액티브 메시지 생성 (도구 호출 없이 응답만)"""
+    """프로액티브 메시지 생성 — 최근 대화를 반드시 참조해서 맥락 있는 메시지를 보냄."""
     client = _get_client()
 
-    system = SYSTEM_PROMPT
+    # 최근 대화가 없으면 DB에서 직접 로드
+    if not recent_messages:
+        from chiro_bot import database as db
+        recent_messages = await db.get_recent_messages(15)
+
+    system = SYSTEM_PROMPT + """
+
+## 프로액티브 메시지 규칙 (봇이 먼저 보내는 메시지)
+- 반드시 최근 대화 흐름을 확인하고, 이미 한 말을 반복하지 마.
+- 유저가 "알려줘", "시간 전에 알림 줘"라고 했으면 → 해당 시간에 알림만 보내. 플랜 재정리 제안 하지 마.
+- 유저가 이미 알고 있는 정보를 다시 말하지 마.
+- 할 말이 없으면 보내지 마. 빈 문자열 "" 반환해도 됨.
+- 마감이 가까운 태스크가 있으면 그것만 알려줘. 다른 태스크 언급 불필요."""
+
     context = f"상황: {situation}\n"
     if tasks:
         context += "오늘 태스크:\n" + "\n".join(
-            f"- {t['title']} (상태: {t['status']}, 미룸: {t['postpone_count']}회)"
+            f"- {t['title']} (상태: {t['status']}, 마감: {t.get('deadline', '없음')})"
             for t in tasks
         ) + "\n"
     if plan:
@@ -181,18 +194,18 @@ async def generate_proactive_message(
         ) + "\n"
 
     messages = [{"role": "system", "content": system}]
-    if recent_messages:
-        for m in recent_messages[-10:]:
-            role = "assistant" if m.get("direction") == "bot" else "user"
-            messages.append({"role": role, "content": m["content"]})
-    messages.append({"role": "user", "content": f"{context}\n위 상황에 맞는 메시지를 보내줘. 3줄 이내."})
+    # 최근 대화 히스토리 반드시 포함
+    for m in recent_messages[-15:]:
+        role = "assistant" if m.get("direction") == "bot" else "user"
+        messages.append({"role": role, "content": m["content"]})
+    messages.append({"role": "user", "content": f"{context}\n위 상황에 맞는 메시지를 보내줘. 이미 한 말 반복 금지. 할 말 없으면 빈 문자열. 3줄 이내."})
 
     try:
         response = await client.chat.completions.create(
             model=AI_MODEL,
             messages=messages,
             temperature=0.7,
-            max_tokens=300,
+            max_tokens=200,
         )
         return response.choices[0].message.content.strip()
     except Exception as e:

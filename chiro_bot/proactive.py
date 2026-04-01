@@ -28,10 +28,21 @@ ESCALATION_INTERVALS = {
 
 
 async def _send_bot_message(text: str):
-    """텔레그램으로 직접 메시지 발송 (프로액티브용)"""
+    """텔레그램으로 직접 메시지 발송 (프로액티브용). 빈 메시지는 무시."""
+    if not text or not text.strip() or text.strip() == '""':
+        logger.debug("빈 메시지 — 발송 스킵")
+        return
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         logger.warning("봇 토큰 또는 채팅 ID 미설정 — 메시지 발송 스킵")
         return
+
+    # 마지막 봇 메시지와 너무 비슷하면 스킵 (반복 방지)
+    recent = await db.get_recent_messages(3)
+    for m in recent:
+        if m.get("direction") == "bot" and m["content"].strip() == text.strip():
+            logger.debug("중복 메시지 — 발송 스킵")
+            return
+
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
     await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
     await db.log_message("bot", text)
