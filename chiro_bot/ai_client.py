@@ -1,21 +1,74 @@
-"""AI 엔진 — Function Calling 기반 자율 판단 구조.
-AI가 대화를 보고 스스로 판단해서 도구를 호출하고, 자연스럽게 응답한다.
-하드코딩된 인텐트 라우팅 없음."""
+"""AI 엔진 — 역할 축소 버전.
+AI는 판단하지 않는다. 코드가 판단한다.
+AI가 하는 것: 인텐트 파싱, 아침 확언, 저녁 코멘트, 일반 대화 응답."""
 from __future__ import annotations
 
 import json
 import logging
+import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
+
 from openai import AsyncOpenAI
+
 from chiro_bot.config import AI_API_KEY, AI_BASE_URL, AI_MODEL
-from chiro_bot.tools import TOOL_SCHEMAS, execute_tool
 
 logger = logging.getLogger(__name__)
 
 _client = None
 _pattern_cache: str = ""
 _pattern_cache_time: float = 0
+
+# ============================================================
+# 프롬프트
+# ============================================================
+
+INTENT_PARSE_PROMPT = """너는 JSON 변환기야. 유저 메시지를 읽고, 의도를 JSON으로 반환해.
+자연어 응답 절대 금지. 반드시 JSON만 반환해.
+
+가능한 인텐트:
+- add_task: 할 일 등록 {{"intent": "add_task", "title": "...", "deadline": "...", "estimated_minutes": ...}}
+- complete_task: 완료 {{"intent": "complete_task", "hint": "..."}}
+- defer_task: 미루기 {{"intent": "defer_task", "hint": "...", "new_time": "..."}}
+- fail_task: 못함 {{"intent": "fail_task", "hint": "..."}}
+- partial_complete: 부분완료 {{"intent": "partial_complete", "hint": "...", "progress": 50}}
+- set_reminder: 알림 요청 {{"intent": "set_reminder", "time": "HH:MM", "message": "..."}}
+- add_routine: 루틴 등록 {{"intent": "add_routine", "routines": [...]}}
+- add_dnd: 방해금지 {{"intent": "add_dnd", "start": "HH:MM", "end": "HH:MM", "reason": "..."}}
+- save_idea: 아이디어 {{"intent": "save_idea", "content": "..."}}
+- ask_status: 현재 상태 질문 {{"intent": "ask_status"}}
+- answer_question: 수집 질문에 대한 답변 {{"intent": "answer_question", "field": "duration/deadline/start_time/dnd", "value": "..."}}
+- confirm: 확인/동의 {{"intent": "confirm"}}
+- reject: 거부/수정 요청 {{"intent": "reject", "reason": "..."}}
+- frustrated: 짜증/불만 {{"intent": "frustrated"}}
+- want_rest: 쉬겠다 {{"intent": "want_rest"}}
+- emergency: 긴급 일정 {{"intent": "emergency", "title": "...", "duration_minutes": ...}}
+- chat: 일반 대화 {{"intent": "chat", "topic": "..."}}
+- unclear: 판단 불가 {{"intent": "unclear"}}
+
+현재 대화 상태: {current_state}
+마지막 봇 질문: {last_bot_question}
+
+유저 메시지를 보고 JSON 하나만 반환해. 설명 금지."""
+
+AFFIRMATION_PROMPT = """한 줄짜리 아침 확언을 만들어.
+규칙: 빈 격려 금지("화이팅" 금지). 날카롭고 짧게. 20자 이내.
+이모지 금지. 느낌표 최대 1개.
+예시:
+- "시작이 반이다는 거짓말이에요. 시작이 전부예요."
+- "완벽하게 하려다 아무것도 안 하는 게 최악이에요."
+- "어제보다 1% 나아지면 충분해요."
+- "지금 안 하면 내일의 내가 고생해요."
+한 줄만 반환해. 따옴표 없이."""
+
+EVENING_COMMENT_PROMPT = "아래 통계를 보고 한 줄 코멘트. 수치 기반. 빈 칭찬 금지. 20자 내외."
+
+CHAT_PERSONA_PROMPT = """너는 신님의 개인 비서야.
+규칙: 신님 호칭, 해요체, 3줄 이내. 이모지 금지. 빈 칭찬 금지."""
+
+# ============================================================
+# 클라이언트
+# ============================================================
 
 
 def _get_client() -> AsyncOpenAI:
@@ -25,85 +78,16 @@ def _get_client() -> AsyncOpenAI:
     return _client
 
 
-async def _get_pattern_context() -> str:
-    global _pattern_cache, _pattern_cache_time
-    import time
-    now = time.time()
-    if now - _pattern_cache_time < 300 and _pattern_cache:
-        return _pattern_cache
-    try:
-        from chiro_bot.patterns import get_pattern_summary
-        _pattern_cache = await get_pattern_summary()
-        _pattern_cache_time = now
-    except Exception:
-        _pattern_cache = ""
-    return _pattern_cache
-
-
-SYSTEM_PROMPT = """너는 신님의 전담 개인 비서야.
-
-## 정체성
-- 오직 신님만을 위해 존재하는 비서. 유저를 "신님"이라고 부름.
-- "신님은 할 수 있는 분이에요. 저는 그걸 까먹지 않게 옆에 있는 거예요."
-- "우리" 프레이밍: "우리 오늘 이거 해야 해요."
-- 봇이라는 사실을 숨기지 않음: "저는 강요할 수 없어요. 선택은 신님 거예요. 저는 선택지를 보여드리는 거예요."
-
-## 말투
-- 해요체. 존댓말 + 살짝 친근.
-- 짧게. 한 메시지 3줄 이내.
-- 이모지 최소한.
-- 반말 전환 절대 안 함.
-- 기계적 문구("등록되었어요!") 대신 자연스럽게("신님, 11시 50분에 알려드릴게요.").
-
-## 절대 금지
-- 명령형 → "할 수 있어요?"로
-- 빈 칭찬 ("잘했어요!") → 수치/팩트 피드백으로
-- 비난, 죄책감, 비교
-- 과잉 공감 ("정말 힘드시죠...")
-- 방어적 반응 ("저도 신님을 위해서...")
-- 불필요한 사과 ("죄송해요")
-- "정말요?", "하나만이라도..." 같은 강요
-
-## 상황별 대응
-- 신님이 짜증내면 → "잔소리처럼 느껴질 수 있어요." 감정 인정 후 선택지 제시. 방어/사과 금지.
-- 신님이 쉬겠다고 하면 → "알겠어요. 중간에 할 거 생기면 말씀해주세요." 존중. 강요 금지.
-- 신님이 "쉬고 나서 하면 안 돼?"라고 하면 → 쉬는 것 허용하되, 이후 일정 재계산해서 보여줌. 판단은 신님이.
-- 모호한 답변 → "몇 시쯤이요? 대충이라도 괜찮아요." 재질문은 부드럽게.
-- 질문은 한 번에 하나만.
-
-## 컨디션 관리
-- 신님이 직접 피곤/졸림/기분 등을 말할 때만 → log_condition 호출.
-- 신님이 말하지 않았는데 추정해서 기록하지 마.
-- 컨디션 안 좋으면 스케줄 조정 제안 가능.
-- 운동은 부드럽게만: "가벼운 산책이라도 어때요? 도저히 못하겠어요?"
-
-## 판단력
-너는 똑똑한 비서야. 비서라면 어떻게 할지 항상 생각해.
-
-- 현재 시각과 요일을 인식해. 시스템이 매번 알려줌.
-- 루틴 확인해서 지금 뭐 하는 시간인지 파악해. 업무 중이면 방해 최소화.
-- 오늘 할 일과 내일 할 일을 절대 섞지 마.
-- 마감 빠른 것 먼저. 시간순 상식으로 판단.
-- 태스크 등록 시 준비물/전제조건 확인: "뭐 가져가야 해요?"
-- 기존 루틴과 충돌하면 알려줘: "그 시간에 업무 중이신데, 괜찮아요?"
-- 지나간 마감의 태스크는 신님에게 "이거 어떻게 할까요?" 물어봐.
-
-## 리마인더 vs 태스크 구분
-- "~에 알려줘", "~시에 알림", "리마인드" → set_reminder (단순 알림)
-- "~해야 해", "~할 거야", "할 일" → add_task (실행해야 할 일)
-- 절대 헷갈리지 마. "점심시간에 알려줘"는 리마인더지 태스크가 아니야.
-
-## 도구
-유저 메시지를 보고 스스로 판단해서 필요한 도구를 호출해.
-- 여러 도구를 연속 호출해도 됨.
-- 필요 없으면 안 호출해도 됨.
-- 결과를 보고 자연스럽게 응답."""
+# ============================================================
+# 컨텍스트 빌더 (인텐트 파싱용 current_state에 사용)
+# ============================================================
 
 
 async def _build_context() -> str:
-    """매 대화마다 AI에게 주입할 현재 상황 컨텍스트"""
+    """매 대화마다 주입할 현재 상황 컨텍스트"""
     from chiro_bot import database as db
     from chiro_bot.config import TIMEZONE
+
     now = datetime.now(ZoneInfo(TIMEZONE))
     dow_names = ["월", "화", "수", "목", "금", "토", "일"]
 
@@ -121,12 +105,18 @@ async def _build_context() -> str:
                 current_routine = r
                 break
         if current_routine:
-            ctx_parts.append(f"- 유저 현재 상태: {current_routine['label']} 중 ({current_routine['start_time']}~{current_routine['end_time']})")
-        ctx_parts.append("- 오늘 루틴: " + ", ".join(
-            f"{r['start_time']}~{r['end_time']} {r['label']}" for r in routines
-        ))
+            ctx_parts.append(
+                f"- 유저 현재 상태: {current_routine['label']} 중 "
+                f"({current_routine['start_time']}~{current_routine['end_time']})"
+            )
+        ctx_parts.append(
+            "- 오늘 루틴: "
+            + ", ".join(
+                f"{r['start_time']}~{r['end_time']} {r['label']}" for r in routines
+            )
+        )
 
-    # 오늘 태스크 (날짜별 구분)
+    # 오늘 태스크
     tasks = await db.get_today_tasks()
     if tasks:
         today_str = now.strftime("%Y-%m-%d")
@@ -139,148 +129,182 @@ async def _build_context() -> str:
             else:
                 today_tasks.append(t)
         if today_tasks:
-            ctx_parts.append("- 오늘 태스크: " + ", ".join(
-                f"{t['title']}({t.get('deadline','시간미정')}, {t['status']})" for t in today_tasks
-            ))
+            ctx_parts.append(
+                "- 오늘 태스크: "
+                + ", ".join(
+                    f"{t['title']}({t.get('deadline', '시간미정')}, {t['status']})"
+                    for t in today_tasks
+                )
+            )
         if other_tasks:
-            ctx_parts.append("- 다른 날 태스크: " + ", ".join(
-                f"{t['title']}({t.get('deadline','미정')})" for t in other_tasks
-            ))
+            ctx_parts.append(
+                "- 다른 날 태스크: "
+                + ", ".join(
+                    f"{t['title']}({t.get('deadline', '미정')})" for t in other_tasks
+                )
+            )
 
     # 오늘 DND
     dnd = await db.get_today_dnd()
     if dnd:
-        ctx_parts.append("- DND: " + ", ".join(f"{d['start_time']}~{d['end_time']}" for d in dnd))
+        ctx_parts.append(
+            "- DND: "
+            + ", ".join(f"{d['start_time']}~{d['end_time']}" for d in dnd)
+        )
 
     # 오늘 컨디션
     conditions = await db.get_today_conditions()
     if conditions:
         last = conditions[-1]
-        ctx_parts.append(f"- 마지막 컨디션: 에너지 {last.get('energy_level','?')}/5, 기분: {last.get('mood','?')} ({last.get('time','')})")
+        ctx_parts.append(
+            f"- 마지막 컨디션: 에너지 {last.get('energy_level', '?')}/5, "
+            f"기분: {last.get('mood', '?')} ({last.get('time', '')})"
+        )
 
     return "\n".join(ctx_parts)
 
 
-async def chat(user_message: str, conversation_history: list = None) -> tuple:
-    """
-    메인 대화 함수. AI가 자율적으로 판단해서 도구를 호출하고 응답.
-    반환: (응답 텍스트, 호출된 도구 목록)
-    """
+async def _get_pattern_context() -> str:
+    global _pattern_cache, _pattern_cache_time
+    now = time.time()
+    if now - _pattern_cache_time < 300 and _pattern_cache:
+        return _pattern_cache
+    try:
+        from chiro_bot.patterns import get_pattern_summary
+
+        _pattern_cache = await get_pattern_summary()
+        _pattern_cache_time = now
+    except Exception:
+        _pattern_cache = ""
+    return _pattern_cache
+
+
+# ============================================================
+# 1) 인텐트 파싱
+# ============================================================
+
+
+async def parse_intent(
+    user_message: str,
+    current_state: str = "",
+    last_bot_question: str = "",
+) -> dict:
+    """유저 메시지 → 구조화된 인텐트 JSON. AI는 판단만, 응답 생성 안 함."""
     client = _get_client()
 
-    # 시스템 프롬프트 + 현재 상황 컨텍스트
-    system = SYSTEM_PROMPT
-    context = await _build_context()
-    system += f"\n\n{context}"
+    prompt = INTENT_PARSE_PROMPT.format(
+        current_state=current_state or "없음",
+        last_bot_question=last_bot_question or "없음",
+    )
 
-    patterns = await _get_pattern_context()
-    if patterns and patterns != "아직 축적된 패턴 데이터가 없음.":
-        system += f"\n\n## 유저 행동 패턴 데이터\n{patterns}"
+    messages = [
+        {"role": "system", "content": prompt},
+        {"role": "user", "content": user_message},
+    ]
 
-    # 대화 히스토리 구성
-    messages = [{"role": "system", "content": system}]
-    if conversation_history:
-        for m in conversation_history[-15:]:
+    try:
+        response = await client.chat.completions.create(
+            model=AI_MODEL,
+            messages=messages,
+            temperature=0.0,
+            max_tokens=300,
+        )
+        raw = response.choices[0].message.content.strip()
+        # JSON 블록 안에 감싸져 있을 수 있음
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+            raw = raw.strip()
+        return json.loads(raw)
+    except (json.JSONDecodeError, Exception) as e:
+        logger.error(f"인텐트 파싱 실패: {e}")
+        return {"intent": "unclear"}
+
+
+# ============================================================
+# 2) 아침 확언
+# ============================================================
+
+
+async def generate_affirmation() -> str:
+    """매일 다른 한 줄 아침 확언 생성."""
+    client = _get_client()
+
+    messages = [
+        {"role": "system", "content": AFFIRMATION_PROMPT},
+        {"role": "user", "content": "오늘의 확언 하나 만들어줘."},
+    ]
+
+    try:
+        response = await client.chat.completions.create(
+            model=AI_MODEL,
+            messages=messages,
+            temperature=0.8,
+            max_tokens=60,
+        )
+        return response.choices[0].message.content.strip().strip('"')
+    except Exception as e:
+        logger.error(f"확언 생성 실패: {e}")
+        return "지금 안 하면 내일의 내가 고생해요."
+
+
+# ============================================================
+# 3) 저녁 보고서 코멘트
+# ============================================================
+
+
+async def generate_evening_comment(stats_json: str) -> str:
+    """오늘 통계 기반 한 줄 코멘트. 수치 기반, 빈 칭찬 금지."""
+    client = _get_client()
+
+    messages = [
+        {"role": "system", "content": EVENING_COMMENT_PROMPT},
+        {"role": "user", "content": stats_json},
+    ]
+
+    try:
+        response = await client.chat.completions.create(
+            model=AI_MODEL,
+            messages=messages,
+            temperature=0.3,
+            max_tokens=60,
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        logger.error(f"저녁 코멘트 생성 실패: {e}")
+        return ""
+
+
+# ============================================================
+# 4) 일반 대화 응답 (유일한 자유 응답 지점)
+# ============================================================
+
+
+async def generate_chat_response(
+    user_message: str,
+    history: list = None,
+) -> str:
+    """일반 대화 전용. AI가 자유 응답하는 유일한 함수."""
+    client = _get_client()
+
+    messages = [{"role": "system", "content": CHAT_PERSONA_PROMPT}]
+
+    if history:
+        for m in history[-10:]:
             role = "assistant" if m.get("direction") == "bot" else "user"
             messages.append({"role": role, "content": m["content"]})
+
     messages.append({"role": "user", "content": user_message})
-
-    called_tools = []
-
-    # 최대 5회 도구 호출 루프 (AI가 도구를 여러 번 호출할 수 있음)
-    for _ in range(5):
-        try:
-            response = await client.chat.completions.create(
-                model=AI_MODEL,
-                messages=messages,
-                tools=TOOL_SCHEMAS,
-                tool_choice="auto",
-                temperature=0.7,
-                max_tokens=500,
-            )
-        except Exception as e:
-            logger.error(f"AI 호출 실패: {e}")
-            return f"(AI 응답 생성 실패: {e})", []
-
-        msg = response.choices[0].message
-
-        # 도구 호출이 없으면 → 최종 응답
-        if not msg.tool_calls:
-            return msg.content or "", called_tools
-
-        # 도구 호출 실행
-        messages.append(msg)  # assistant message with tool_calls
-
-        for tool_call in msg.tool_calls:
-            fn_name = tool_call.function.name
-            try:
-                fn_args = json.loads(tool_call.function.arguments)
-            except json.JSONDecodeError:
-                fn_args = {}
-
-            logger.info(f"도구 호출: {fn_name}({fn_args})")
-            result = await execute_tool(fn_name, fn_args)
-            called_tools.append({"name": fn_name, "args": fn_args, "result": result})
-
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tool_call.id,
-                "content": result,
-            })
-
-    # 루프 초과 (안전장치)
-    return "잠시 처리 중이에요. 다시 말씀해주세요.", called_tools
-
-
-async def generate_proactive_message(
-    situation: str,
-    tasks: list = None,
-    plan: list = None,
-    recent_messages: list = None
-) -> str:
-    """프로액티브 메시지 생성 — 최근 대화를 반드시 참조해서 맥락 있는 메시지를 보냄."""
-    client = _get_client()
-
-    # 최근 대화가 없으면 DB에서 직접 로드
-    if not recent_messages:
-        from chiro_bot import database as db
-        recent_messages = await db.get_recent_messages(15)
-
-    system = SYSTEM_PROMPT + """
-
-## 프로액티브 메시지 규칙 (봇이 먼저 보내는 메시지)
-- 반드시 최근 대화 흐름을 확인하고, 이미 한 말을 반복하지 마.
-- 유저가 "알려줘", "시간 전에 알림 줘"라고 했으면 → 해당 시간에 알림만 보내. 플랜 재정리 제안 하지 마.
-- 유저가 이미 알고 있는 정보를 다시 말하지 마.
-- 할 말이 없으면 보내지 마. 빈 문자열 "" 반환해도 됨.
-- 마감이 가까운 태스크가 있으면 그것만 알려줘. 다른 태스크 언급 불필요."""
-
-    context = f"상황: {situation}\n"
-    if tasks:
-        context += "오늘 태스크:\n" + "\n".join(
-            f"- {t['title']} (상태: {t['status']}, 마감: {t.get('deadline', '없음')})"
-            for t in tasks
-        ) + "\n"
-    if plan:
-        context += "현재 플랜:\n" + "\n".join(
-            f"- {p['start_time']}~{p['end_time']} {p['title']} ({p.get('task_status', '')})"
-            for p in plan
-        ) + "\n"
-
-    messages = [{"role": "system", "content": system}]
-    # 최근 대화 히스토리 반드시 포함
-    for m in recent_messages[-15:]:
-        role = "assistant" if m.get("direction") == "bot" else "user"
-        messages.append({"role": role, "content": m["content"]})
-    messages.append({"role": "user", "content": f"{context}\n위 상황에 맞는 메시지를 보내줘. 이미 한 말 반복 금지. 할 말 없으면 빈 문자열. 3줄 이내."})
 
     try:
         response = await client.chat.completions.create(
             model=AI_MODEL,
             messages=messages,
             temperature=0.7,
-            max_tokens=200,
+            max_tokens=150,
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
-        return f"(AI 응답 생성 실패: {e})"
+        logger.error(f"대화 응답 생성 실패: {e}")
+        return "잠시 문제가 생겼어요. 다시 말해줄 수 있어요?"
