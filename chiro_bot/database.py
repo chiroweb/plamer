@@ -131,6 +131,19 @@ CREATE TABLE IF NOT EXISTS user_state (
 -- 초기 user_state 삽입
 INSERT OR IGNORE INTO user_state (id, updated_at) VALUES (1, datetime('now'));
 
+-- 컨디션/기분 로그
+CREATE TABLE IF NOT EXISTS condition_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    date TEXT NOT NULL DEFAULT (date('now')),
+    time TEXT NOT NULL,                        -- "HH:MM"
+    energy_level INTEGER,                      -- 1~5
+    mood TEXT,                                 -- 기분 키워드
+    activity TEXT,                             -- 지금 뭐하고 있는지
+    reason TEXT,                               -- 이유/맥락
+    note TEXT,                                 -- AI 또는 유저 메모
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 -- 헬스체크 로그
 CREATE TABLE IF NOT EXISTS healthcheck_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -520,6 +533,40 @@ async def is_healthcheck_sent_today() -> bool:
         )
         row = await cursor.fetchone()
         return row and row["cnt"] > 0
+
+
+# ==================== condition_log ====================
+
+async def log_condition(time_hm: str, energy_level: int = None, mood: str = None,
+                        activity: str = None, reason: str = None, note: str = None):
+    async with aiosqlite.connect(DB_PATH) as conn:
+        today = date.today().isoformat()
+        await conn.execute(
+            """INSERT INTO condition_log (date, time, energy_level, mood, activity, reason, note)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (today, time_hm, energy_level, mood, activity, reason, note)
+        )
+        await conn.commit()
+
+
+async def get_today_conditions() -> list:
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        today = date.today().isoformat()
+        cursor = await conn.execute(
+            "SELECT * FROM condition_log WHERE date = ? ORDER BY time ASC", (today,)
+        )
+        return [dict(r) for r in await cursor.fetchall()]
+
+
+async def get_condition_history(days: int = 14) -> list:
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute(
+            "SELECT * FROM condition_log ORDER BY date DESC, time DESC LIMIT ?",
+            (days * 10,)
+        )
+        return [dict(r) for r in await cursor.fetchall()]
 
 
 # ==================== DB 백업 ====================

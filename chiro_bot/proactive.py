@@ -273,9 +273,52 @@ async def proactive_check():
                 await _send_bot_message(msg)
                 return
 
-    # 플랜은 있지만 아직 시간 안 된 경우
+    # 플랜은 있지만 아직 시간 안 된 경우 → 컨디션 체크 기회
     upcoming = [s for s in plan if s["start_time"] > now_hm
                 and s.get("task_status") in ("pending", "scheduled")]
+
+    # ============================================================
+    # Step 6.5: 컨디션 체크 (2~3시간마다)
+    # ============================================================
+    today_conditions = await db.get_today_conditions()
+    last_condition_time = None
+    if today_conditions:
+        last_condition_time = today_conditions[-1].get("time", "00:00")
+
+    # 마지막 컨디션 체크로부터 2시간 이상 지났으면
+    should_check_condition = False
+    if not today_conditions:
+        # 오늘 첫 체크 — 오전 중 1회
+        if hour >= MORNING_HOUR + 1:
+            should_check_condition = True
+    elif last_condition_time:
+        last_min = int(last_condition_time.split(":")[0]) * 60 + int(last_condition_time.split(":")[1])
+        now_min = hour * 60 + minute
+        if now_min - last_min >= 120:  # 2시간
+            should_check_condition = True
+
+    if should_check_condition and not active_tasks:
+        # 다른 긴급한 알림이 없을 때만
+        conditions_today = len(today_conditions)
+        if conditions_today == 0:
+            msg = await generate_proactive_message(
+                "컨디션 체크 시간. 유저에게 지금 기분이나 에너지 상태를 가볍게 물어봐. "
+                "강요하지 말고 자연스럽게. 1줄이면 충분.",
+                tasks=tasks
+            )
+        elif conditions_today <= 2:
+            last_mood = today_conditions[-1].get("mood", "")
+            msg = await generate_proactive_message(
+                f"컨디션 중간 체크. 이전 기분: {last_mood}. "
+                "지금은 어떤지 가볍게 물어봐. 운동 같은 건강 활동도 슬쩍 제안 가능.",
+                tasks=tasks
+            )
+        else:
+            msg = None  # 하루 3번 이상은 과하니까
+        if msg:
+            await _send_bot_message(msg)
+            return
+
     if upcoming:
         return  # 다음 태스크까지 조용히 대기
 

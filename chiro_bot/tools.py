@@ -176,6 +176,38 @@ TOOL_SCHEMAS = [
             "parameters": {"type": "object", "properties": {}, "required": []},
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "log_condition",
+            "description": "유저의 현재 컨디션/기분/에너지 상태를 기록한다. 유저가 기분, 컨디션, 피곤함, 졸림, 의욕 등을 말하면 호출. 유저가 뭐하고 있는지 말할 때도 활용.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "energy_level": {"type": "integer", "description": "에너지 레벨 1~5 (1=매우 저조, 3=보통, 5=매우 좋음). AI가 대화에서 추정."},
+                    "mood": {"type": "string", "description": "기분 키워드 (좋음/보통/피곤/짜증/우울/의욕넘침/졸림 등)"},
+                    "activity": {"type": "string", "description": "지금 하고 있는 활동"},
+                    "reason": {"type": "string", "description": "그 기분/컨디션의 이유 (유저가 말했으면)"},
+                    "note": {"type": "string", "description": "추가 메모"},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_condition_history",
+            "description": "유저의 컨디션/기분 기록을 조회한다. 패턴 분석이나 유저가 자기 컨디션 이력을 물어볼 때.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "days": {"type": "integer", "description": "조회할 일수 (기본 7일)"},
+                },
+                "required": [],
+            },
+        },
+    },
 ]
 
 # ============================================================
@@ -325,6 +357,38 @@ async def execute_tool(name: str, args: dict) -> str:
             for r in rows:
                 formatted.append(f"{dow_names[r['day_of_week']]} {r['start_time']}~{r['end_time']} {r['label']}")
             return json.dumps({"routines": formatted, "count": len(rows)}, ensure_ascii=False)
+
+        elif name == "log_condition":
+            now_hm = datetime.now(ZoneInfo(TIMEZONE)).strftime("%H:%M")
+            await db.log_condition(
+                time_hm=now_hm,
+                energy_level=args.get("energy_level"),
+                mood=args.get("mood"),
+                activity=args.get("activity"),
+                reason=args.get("reason"),
+                note=args.get("note"),
+            )
+            today_conditions = await db.get_today_conditions()
+            return json.dumps({
+                "success": True,
+                "logged_at": now_hm,
+                "energy": args.get("energy_level"),
+                "mood": args.get("mood"),
+                "today_logs_count": len(today_conditions),
+                "message": "컨디션 기록 완료.",
+            }, ensure_ascii=False)
+
+        elif name == "get_condition_history":
+            days = args.get("days", 7)
+            history = await db.get_condition_history(days)
+            return json.dumps({
+                "count": len(history),
+                "logs": [
+                    {"date": h["date"], "time": h["time"], "energy": h.get("energy_level"),
+                     "mood": h.get("mood"), "activity": h.get("activity"), "reason": h.get("reason")}
+                    for h in history[:30]
+                ],
+            }, ensure_ascii=False)
 
         else:
             return json.dumps({"error": f"알 수 없는 도구: {name}"}, ensure_ascii=False)
