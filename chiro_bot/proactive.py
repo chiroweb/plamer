@@ -13,7 +13,7 @@ from chiro_bot.config import (
     MORNING_HOUR, EVENING_HOUR
 )
 from chiro_bot import database as db
-from chiro_bot.ai_client import generate_proactive_message, generate_response
+from chiro_bot.ai_client import generate_proactive_message
 from chiro_bot.patterns import update_patterns
 
 logger = logging.getLogger(__name__)
@@ -327,10 +327,10 @@ async def _evening_report():
     report_text = "\n".join(report_lines)
 
     # AI로 코멘트 추가
-    ai_comment = await generate_response(
-        f"유저의 오늘 하루 리포트야:\n{report_text}\n\n"
-        f"완료율과 미룸/실패 패턴을 보고 짧게 코멘트해줘 (2~3문장). "
-        f"잘했으면 칭찬, 못했으면 건설적 피드백."
+    ai_comment = await generate_proactive_message(
+        f"저녁 리뷰 코멘트. 유저 리포트:\n{report_text}\n"
+        f"완료율과 미룸/실패 패턴을 보고 짧게 코멘트. 수치 기반으로.",
+        tasks=stats["tasks"]
     )
 
     full_report = f"{report_text}\n\n💬 {ai_comment}"
