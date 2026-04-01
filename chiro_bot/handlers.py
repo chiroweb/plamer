@@ -33,18 +33,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     recent = await db.get_recent_messages(15)
 
     # AI에게 전달 — AI가 알아서 판단하고 도구 호출
-    reply, called_tools = await chat(user_text, recent)
+    try:
+        reply, called_tools = await chat(user_text, recent)
 
-    if called_tools:
-        logger.info(f"AI 도구 호출: {[t['name'] for t in called_tools]}")
+        if called_tools:
+            logger.info(f"AI 도구 호출: {[t['name'] for t in called_tools]}")
 
-    # 응답 발송
-    if reply:
-        await db.log_message("bot", reply)
-        await db.update_user_state(
-            last_bot_message_at=datetime.now(ZoneInfo(TIMEZONE)).isoformat()
-        )
-        await update.message.reply_text(reply)
+        if reply:
+            await db.log_message("bot", reply)
+            await db.update_user_state(
+                last_bot_message_at=datetime.now(ZoneInfo(TIMEZONE)).isoformat()
+            )
+            await update.message.reply_text(reply)
+    except Exception as e:
+        logger.error(f"메시지 처리 오류: {e}")
+        await update.message.reply_text("잠시 문제가 생겼어요. 다시 말씀해주세요.")
 
 
 # ==================== 커맨드용 함수 (main.py에서 import) ====================

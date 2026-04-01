@@ -171,6 +171,37 @@ TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
+            "name": "delete_task",
+            "description": "태스크를 삭제한다. 유저가 실수로 등록했거나 취소할 때.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_title_hint": {"type": "string", "description": "삭제할 태스크 제목 힌트"},
+                },
+                "required": ["task_title_hint"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_task",
+            "description": "기존 태스크의 마감, 소요시간, 제목 등을 수정한다.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_title_hint": {"type": "string", "description": "수정할 태스크 제목 힌트"},
+                    "new_title": {"type": "string", "description": "새 제목 (변경 시)"},
+                    "new_deadline": {"type": "string", "description": "새 마감 (변경 시)"},
+                    "new_estimated_minutes": {"type": "integer", "description": "새 소요시간 (변경 시)"},
+                },
+                "required": ["task_title_hint"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "get_routines",
             "description": "등록된 루틴 목록을 조회한다.",
             "parameters": {"type": "object", "properties": {}, "required": []},
@@ -357,6 +388,41 @@ async def execute_tool(name: str, args: dict) -> str:
             for r in rows:
                 formatted.append(f"{dow_names[r['day_of_week']]} {r['start_time']}~{r['end_time']} {r['label']}")
             return json.dumps({"routines": formatted, "count": len(rows)}, ensure_ascii=False)
+
+        elif name == "delete_task":
+            tasks = await db.get_today_tasks()
+            task = _find_task(tasks, args.get("task_title_hint", ""), ["pending", "in_progress", "deferred"])
+            if not task:
+                return json.dumps({"success": False, "message": "삭제할 태스크를 찾지 못했어요.", "tasks": [t["title"] for t in tasks]}, ensure_ascii=False)
+            import aiosqlite
+            from chiro_bot.config import DB_PATH
+            async with aiosqlite.connect(DB_PATH) as conn:
+                await conn.execute("DELETE FROM daily_tasks WHERE id = ?", (task["id"],))
+                await conn.execute("DELETE FROM daily_plan WHERE task_id = ?", (task["id"],))
+                await conn.commit()
+            return json.dumps({"success": True, "deleted": task["title"]}, ensure_ascii=False)
+
+        elif name == "update_task":
+            tasks = await db.get_today_tasks()
+            task = _find_task(tasks, args.get("task_title_hint", ""), ["pending", "in_progress", "deferred"])
+            if not task:
+                return json.dumps({"success": False, "message": "수정할 태스크를 찾지 못했어요."}, ensure_ascii=False)
+            import aiosqlite
+            from chiro_bot.config import DB_PATH
+            updates = []
+            vals = []
+            if args.get("new_title"):
+                updates.append("title = ?"); vals.append(args["new_title"])
+            if args.get("new_deadline"):
+                updates.append("deadline = ?"); vals.append(args["new_deadline"])
+            if args.get("new_estimated_minutes"):
+                updates.append("estimated_minutes = ?"); vals.append(args["new_estimated_minutes"])
+            if updates:
+                vals.append(task["id"])
+                async with aiosqlite.connect(DB_PATH) as conn:
+                    await conn.execute(f"UPDATE daily_tasks SET {', '.join(updates)} WHERE id = ?", vals)
+                    await conn.commit()
+            return json.dumps({"success": True, "updated": task["title"], "changes": {k: v for k, v in args.items() if k != "task_title_hint"}}, ensure_ascii=False)
 
         elif name == "log_condition":
             now_hm = datetime.now(ZoneInfo(TIMEZONE)).strftime("%H:%M")
