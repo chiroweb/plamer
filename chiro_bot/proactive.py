@@ -140,9 +140,40 @@ async def proactive_check():
         logger.debug(f"DND 시간대 ({now_hm}) — 대기")
         return
 
-    # 활동 시간 외면 대기
-    if hour < MORNING_HOUR or hour >= EVENING_HOUR:
+    # 활동 시간 외면 대기 (취침 루틴 제외)
+    if hour < MORNING_HOUR or hour > BEDTIME_HOUR:
         return
+
+    # ============================================================
+    # 쿨다운: 마지막 봇 메시지 이후 최소 15분은 지나야 다음 프로액티브 발송
+    # (마감 임박 알림은 예외)
+    # ============================================================
+    last_bot = await db.get_last_bot_message_time()
+    if last_bot:
+        elapsed = (datetime.now() - last_bot).total_seconds() / 60
+        if elapsed < 15:
+            logger.debug(f"쿨다운 중 ({elapsed:.0f}분 경과) — 대기")
+            # 마감 임박 태스크만 예외로 체크
+            _has_urgent = False
+            for t in (await db.get_today_tasks()):
+                if t.get("deadline") and t["status"] in ("pending", "in_progress"):
+                    try:
+                        dl_str = t["deadline"]
+                        if len(dl_str) <= 5:
+                            dl = datetime.combine(now.date(),
+                                                  datetime.strptime(dl_str, "%H:%M").time(),
+                                                  tzinfo=ZoneInfo(TIMEZONE))
+                        else:
+                            dl = datetime.fromisoformat(dl_str)
+                            if dl.tzinfo is None:
+                                dl = dl.replace(tzinfo=ZoneInfo(TIMEZONE))
+                        if 0 < (dl - now).total_seconds() / 60 <= 15:
+                            _has_urgent = True
+                            break
+                    except (ValueError, TypeError):
+                        continue
+            if not _has_urgent:
+                return
 
     # ============================================================
     # Step 5: 진행 중 태스크 확인 + 마감 압박
@@ -357,18 +388,8 @@ async def proactive_check():
             await db.bump_no_response()
             return
 
-    # 태스크는 있는데 플랜 없음
-    pending = [t for t in tasks if t["status"] in ("pending", "deferred")]
-    if pending and not plan:
-        msg = await generate_proactive_message(
-            f"태스크 {len(pending)}개 있는데 플랜이 없어. 플랜 짜자!",
-            tasks=tasks
-        )
-        await _send_bot_message(msg)
-        return
-
-    # 진짜 할 것 없음
-    logger.debug("할 것 없음 — 대기")
+    # 할 것 없음 — 조용히 대기. 이유 없이 메시지 보내지 않음.
+    logger.debug("보낼 이유 없음 — 대기")
 
 
 # ============================================================
