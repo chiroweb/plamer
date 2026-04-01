@@ -224,16 +224,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # ----------------------------------------------------------
         elif intent == "add_routine":
-            result_raw = await execute_tool("add_routines", intent_json)
-            result = json.loads(result_raw)
             routines = intent_json.get("routines", [])
-            if routines:
+            # AI가 문자열 배열을 반환하는 경우 방어
+            if routines and isinstance(routines[0], dict):
+                result_raw = await execute_tool("add_routines", intent_json)
                 first = routines[0]
                 label = first.get("label", "루틴")
                 time_range = f"{first.get('start_time', '')}~{first.get('end_time', '')}"
                 reply = templates.routine_added(label, time_range)
             else:
-                reply = "루틴 등록했어요."
+                # 형식이 안 맞으면 AI가 잘못 파싱한 것 — 유저에게 재시도 요청
+                reply = "루틴 형식을 인식하지 못했어요. 예: '매일 23시 취침, 6시 20분 기상'처럼 말해주세요."
 
         # ----------------------------------------------------------
         elif intent == "add_dnd":

@@ -104,9 +104,14 @@ async def _should_escalate(now: datetime) -> bool:
     last_bot = await db.get_last_bot_message_time()
     if not last_bot:
         return False
+    if last_bot.tzinfo is None:
+        last_bot = last_bot.replace(tzinfo=ZoneInfo(TIMEZONE))
     last_user = await db.get_last_user_message_time()
-    if last_user and last_user > last_bot:
-        return False
+    if last_user:
+        if last_user.tzinfo is None:
+            last_user = last_user.replace(tzinfo=ZoneInfo(TIMEZONE))
+        if last_user > last_bot:
+            return False
     state = await db.get_user_state()
     level = state.get("escalation_level", 0)
     interval = ESCALATION_INTERVALS.get(level, ESCALATION_INTERVALS[3])
@@ -118,6 +123,9 @@ async def _minutes_since_last_bot_message(now: datetime) -> float | None:
     last_bot = await db.get_last_bot_message_time()
     if not last_bot:
         return None
+    # timezone 맞추기
+    if last_bot.tzinfo is None:
+        last_bot = last_bot.replace(tzinfo=ZoneInfo(TIMEZONE))
     return (now - last_bot).total_seconds() / 60
 
 
