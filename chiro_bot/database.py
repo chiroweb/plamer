@@ -131,6 +131,16 @@ CREATE TABLE IF NOT EXISTS user_state (
 -- 초기 user_state 삽입
 INSERT OR IGNORE INTO user_state (id, updated_at) VALUES (1, datetime('now'));
 
+-- 리마인더 (알림만. 태스크가 아님.)
+CREATE TABLE IF NOT EXISTS reminders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    date TEXT NOT NULL DEFAULT (date('now')),
+    time TEXT NOT NULL,                        -- "HH:MM" 알림 시각
+    message TEXT NOT NULL,                     -- 알림 내용
+    sent INTEGER NOT NULL DEFAULT 0,           -- 0=미발송, 1=발송완료
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 -- 컨디션/기분 로그
 CREATE TABLE IF NOT EXISTS condition_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -533,6 +543,37 @@ async def is_healthcheck_sent_today() -> bool:
         )
         row = await cursor.fetchone()
         return row and row["cnt"] > 0
+
+
+# ==================== reminders ====================
+
+async def add_reminder(time_hm: str, message: str) -> int:
+    async with aiosqlite.connect(DB_PATH) as conn:
+        today = date.today().isoformat()
+        cursor = await conn.execute(
+            "INSERT INTO reminders (date, time, message) VALUES (?, ?, ?)",
+            (today, time_hm, message)
+        )
+        await conn.commit()
+        return cursor.lastrowid
+
+
+async def get_pending_reminders() -> list:
+    """아직 발송 안 된 오늘 리마인더"""
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        today = date.today().isoformat()
+        cursor = await conn.execute(
+            "SELECT * FROM reminders WHERE date = ? AND sent = 0 ORDER BY time ASC",
+            (today,)
+        )
+        return [dict(r) for r in await cursor.fetchall()]
+
+
+async def mark_reminder_sent(reminder_id: int):
+    async with aiosqlite.connect(DB_PATH) as conn:
+        await conn.execute("UPDATE reminders SET sent = 1 WHERE id = ?", (reminder_id,))
+        await conn.commit()
 
 
 # ==================== condition_log ====================

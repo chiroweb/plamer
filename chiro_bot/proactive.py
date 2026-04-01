@@ -170,7 +170,19 @@ async def proactive_check():
             if not has_urgent:
                 return
 
-    # ---- Step 7: 태스크 관련 알림 ----
+    # ---- Step 7a: 리마인더 발송 ----
+    reminders = await db.get_pending_reminders()
+    for r in reminders:
+        if r["time"] <= now_hm:
+            msg = await generate_proactive_message(
+                f"리마인더 시간이에요. 신님에게 알려줄 내용: '{r['message']}'. "
+                f"자연스럽게 전달해주세요.",
+            )
+            await _send_bot_message(msg)
+            await db.mark_reminder_sent(r["id"])
+            return
+
+    # ---- Step 7b: 태스크 관련 알림 ----
     tasks = await db.get_today_tasks()
     plan = await db.get_today_plan()
 

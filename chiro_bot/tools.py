@@ -210,6 +210,21 @@ TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
+            "name": "set_reminder",
+            "description": "리마인더(알림)를 등록한다. '~에 알려줘', '~시에 알림 줘' 같은 요청에 사용. 태스크가 아니라 단순 알림이다. 태스크 등록이 아님에 주의.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "time": {"type": "string", "description": "알림 시각 HH:MM"},
+                    "message": {"type": "string", "description": "알림 내용 (무엇을 알려줄지)"},
+                },
+                "required": ["time", "message"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "log_condition",
             "description": "유저의 현재 컨디션/기분/에너지 상태를 기록한다. 유저가 기분, 컨디션, 피곤함, 졸림, 의욕 등을 말하면 호출. 유저가 뭐하고 있는지 말할 때도 활용.",
             "parameters": {
@@ -423,6 +438,14 @@ async def execute_tool(name: str, args: dict) -> str:
                     await conn.execute(f"UPDATE daily_tasks SET {', '.join(updates)} WHERE id = ?", vals)
                     await conn.commit()
             return json.dumps({"success": True, "updated": task["title"], "changes": {k: v for k, v in args.items() if k != "task_title_hint"}}, ensure_ascii=False)
+
+        elif name == "set_reminder":
+            await db.add_reminder(args["time"], args["message"])
+            return json.dumps({
+                "success": True,
+                "time": args["time"],
+                "message": args["message"],
+            }, ensure_ascii=False)
 
         elif name == "log_condition":
             now_hm = datetime.now(ZoneInfo(TIMEZONE)).strftime("%H:%M")
