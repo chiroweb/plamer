@@ -17,6 +17,7 @@ TIMEZONE = os.getenv("TIMEZONE", "Asia/Seoul")
 MORNING_HOUR = int(os.getenv("MORNING_HOUR", "8"))
 EVENING_HOUR = int(os.getenv("EVENING_HOUR", "22"))
 PROACTIVE_INTERVAL_MINUTES = int(os.getenv("PROACTIVE_INTERVAL_MINUTES", "15"))
+BEDTIME_HOUR = int(os.getenv("BEDTIME_HOUR", "23"))
 
 # DB
 DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "chiro.db")

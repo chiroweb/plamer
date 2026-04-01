@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 from telegram import Bot
 from chiro_bot.config import (
     TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TIMEZONE,
-    MORNING_HOUR, EVENING_HOUR
+    MORNING_HOUR, EVENING_HOUR, BEDTIME_HOUR
 )
 from chiro_bot import database as db
 from chiro_bot.ai_client import generate_proactive_message
@@ -127,10 +127,10 @@ async def proactive_check():
         return
 
     # ============================================================
-    # Step 3: 저녁 리뷰
+    # Step 3: 취침 전 루틴
     # ============================================================
-    if hour == EVENING_HOUR and minute < 20:
-        await _evening_report()
+    if hour == BEDTIME_HOUR and minute < 20:
+        await _bedtime_routine()
         return
 
     # ============================================================
@@ -375,68 +375,55 @@ async def proactive_check():
 # 저녁 보고서
 # ============================================================
 
-async def _evening_report():
-    """취침 전 루틴 — 하루 점수 + 리포트 + 내일 할 일 정리 + 동기부여"""
-    stats = await db.get_task_stats_today()
-    tasks = stats["tasks"]
-    conditions = await db.get_today_conditions()
-
-    # --- 1. 오늘 하루 리포트 ---
-    if tasks:
-        rate = (stats["done"] / stats["total"] * 100) if stats["total"] > 0 else 0
-        report_lines = [
-            f"신님, 오늘 하루 정리해드릴게요.\n",
-            f"전체 {stats['total']}개 중 {stats['done']}개 완료 ({rate:.0f}%)",
-        ]
-        for t in tasks:
-            emoji = {"done": "✅", "partial": "🟡", "deferred": "⏸️",
-                     "failed": "❌", "pending": "⬜", "in_progress": "🔵"}.get(t["status"], "❓")
-            report_lines.append(f"{emoji} {t['title']}")
-        report_text = "\n".join(report_lines)
-    else:
-        report_text = "신님, 오늘은 등록된 태스크가 없었어요."
-
-    # --- 2. 컨디션 요약 ---
-    condition_summary = ""
-    if conditions:
-        moods = [c.get("mood", "") for c in conditions if c.get("mood")]
-        energies = [c.get("energy_level", 0) for c in conditions if c.get("energy_level")]
-        if energies:
-            avg_energy = sum(energies) / len(energies)
-            condition_summary = f"\n오늘 평균 에너지: {avg_energy:.1f}/5"
-        if moods:
-            condition_summary += f" | 기분 흐름: {' → '.join(moods)}"
-
-    # --- 3. 내일 할 일 미리보기 ---
-    # 내일 날짜의 태스크가 있는지 확인
+async def _bedtime_routine():
+    """취침 전 루틴 — AI에게 데이터만 주고 전부 맡김"""
     from datetime import timedelta
+
+    stats = await db.get_task_stats_today()
+    conditions = await db.get_today_conditions()
+    all_tasks = await db.get_today_tasks()
+
+    # 내일 태스크
     tomorrow = (datetime.now(ZoneInfo(TIMEZONE)) + timedelta(days=1)).strftime("%Y-%m-%d")
-    all_tasks = await db.get_today_tasks()  # 전체 태스크에서 내일 것 찾기
     tomorrow_tasks = [t for t in all_tasks if t.get("deadline", "").startswith(tomorrow)]
 
-    tomorrow_text = ""
-    if tomorrow_tasks:
-        tomorrow_text = "\n\n내일 할 일:\n" + "\n".join(
-            f"  • {t['title']} ({t.get('deadline', '')})" for t in tomorrow_tasks
-        )
+    # 데이터를 JSON으로 넘김 — AI가 알아서 판단
+    import json
+    data = {
+        "오늘_통계": {
+            "전체": stats["total"], "완료": stats["done"],
+            "미완료": stats["pending"], "연기": stats["deferred"],
+            "실패": stats["failed"], "부분완료": stats["partial"],
+            "총_미룸횟수": stats["total_postpones"],
+        },
+        "오늘_태스크": [
+            {"제목": t["title"], "상태": t["status"],
+             "미룸": t["postpone_count"], "실패": t["fail_count"]}
+            for t in stats["tasks"]
+        ],
+        "오늘_컨디션": [
+            {"시각": c["time"], "에너지": c.get("energy_level"),
+             "기분": c.get("mood"), "활동": c.get("activity")}
+            for c in conditions
+        ],
+        "내일_태스크": [
+            {"제목": t["title"], "마감": t.get("deadline")}
+            for t in tomorrow_tasks
+        ],
+    }
 
-    # --- 4. AI가 종합 코멘트 + 하루 점수 + 동기부여 ---
-    ai_prompt = (
-        f"취침 전 루틴이야. 신님에게 보내는 하루 마무리 메시지를 만들어줘.\n\n"
-        f"오늘 리포트:\n{report_text}{condition_summary}\n"
-        f"내일 예정: {tomorrow_text if tomorrow_text else '아직 없음'}\n\n"
-        f"해야 할 것:\n"
-        f"1. 오늘 하루에 10점 만점 점수를 매겨줘 (완료율 + 컨디션 + 노력 종합)\n"
-        f"2. 짧은 코멘트 (수치 기반, 빈 칭찬 금지)\n"
-        f"3. 내일 할 일이 있으면 알려주고, 준비할 게 있는지도\n"
-        f"4. 동기부여 한마디 (날카롭고 짧게, 클리셰 금지)\n"
-        f"5. 푹 쉬라는 인사\n"
-        f"전체 5줄 이내로."
+    msg = await generate_proactive_message(
+        f"취침 전 루틴이야. 아래 데이터를 보고 신님에게 하루 마무리 메시지를 보내줘.\n"
+        f"너의 판단으로 자유롭게 구성해. 단, 반드시 포함할 것:\n"
+        f"- 오늘 하루 10점 만점 점수\n"
+        f"- 내일 할 일이 있으면 미리 알려주고 준비물 체크\n"
+        f"- 동기부여 한마디\n"
+        f"- 잘 자라는 인사\n"
+        f"형식, 길이, 톤은 네가 판단해.\n\n"
+        f"데이터:\n{json.dumps(data, ensure_ascii=False, indent=2)}",
+        tasks=stats["tasks"]
     )
-    ai_comment = await generate_proactive_message(ai_prompt, tasks=tasks)
-
-    full_report = f"{report_text}{condition_summary}{tomorrow_text}\n\n{ai_comment}"
-    await _send_bot_message(full_report)
+    await _send_bot_message(msg)
 
     # DB 저장
     await db.save_daily_report(stats["total"], stats["done"], full_report)
