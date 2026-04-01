@@ -219,7 +219,46 @@ async def proactive_check():
         return
 
     # ============================================================
-    # Step 6: 시작해야 할 태스크 리마인더
+    # Step 5.5: 마감 임박 태스크 직접 알림 (플랜 없이도 작동)
+    # ============================================================
+    pending_tasks = [t for t in tasks if t["status"] in ("pending", "in_progress")]
+    for task in pending_tasks:
+        if task.get("deadline"):
+            try:
+                dl_str = task["deadline"]
+                if len(dl_str) <= 5:
+                    dl = datetime.combine(now.date(),
+                                          datetime.strptime(dl_str, "%H:%M").time(),
+                                          tzinfo=ZoneInfo(TIMEZONE))
+                else:
+                    dl = datetime.fromisoformat(dl_str)
+                    if dl.tzinfo is None:
+                        dl = dl.replace(tzinfo=ZoneInfo(TIMEZONE))
+
+                minutes_until = (dl - now).total_seconds() / 60
+
+                # 15분 전 알림
+                if 0 < minutes_until <= 15 and task["status"] == "pending":
+                    await db.update_task_status(task["id"], "in_progress")
+                    msg = await generate_proactive_message(
+                        f"'{task['title']}' {int(minutes_until)}분 후예요! 준비됐어요?",
+                        tasks=tasks, plan=plan
+                    )
+                    await _send_bot_message(msg)
+                    return
+                # 30분 전 미리 알림
+                elif 15 < minutes_until <= 30 and task["status"] == "pending":
+                    msg = await generate_proactive_message(
+                        f"'{task['title']}' 30분 후예요. 준비해주세요.",
+                        tasks=tasks, plan=plan
+                    )
+                    await _send_bot_message(msg)
+                    return
+            except (ValueError, TypeError):
+                continue
+
+    # ============================================================
+    # Step 6: 시작해야 할 태스크 리마인더 (플랜 기반)
     # ============================================================
     for slot in plan:
         if slot.get("task_status") == "pending" and slot["start_time"] <= now_hm:
