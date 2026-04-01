@@ -376,57 +376,66 @@ async def proactive_check():
 # ============================================================
 
 async def _evening_report():
-    """저녁 보고서 생성 + 아카이브 + DB 백업"""
+    """취침 전 루틴 — 하루 점수 + 리포트 + 내일 할 일 정리 + 동기부여"""
     stats = await db.get_task_stats_today()
     tasks = stats["tasks"]
+    conditions = await db.get_today_conditions()
 
-    if not tasks:
-        await _send_bot_message("오늘은 등록된 태스크가 없었어. 내일은 뭐 할지 생각해봐! 🌙")
-        return
+    # --- 1. 오늘 하루 리포트 ---
+    if tasks:
+        rate = (stats["done"] / stats["total"] * 100) if stats["total"] > 0 else 0
+        report_lines = [
+            f"신님, 오늘 하루 정리해드릴게요.\n",
+            f"전체 {stats['total']}개 중 {stats['done']}개 완료 ({rate:.0f}%)",
+        ]
+        for t in tasks:
+            emoji = {"done": "✅", "partial": "🟡", "deferred": "⏸️",
+                     "failed": "❌", "pending": "⬜", "in_progress": "🔵"}.get(t["status"], "❓")
+            report_lines.append(f"{emoji} {t['title']}")
+        report_text = "\n".join(report_lines)
+    else:
+        report_text = "신님, 오늘은 등록된 태스크가 없었어요."
 
-    # 통계 텍스트
-    report_lines = [
-        "📊 오늘의 리포트\n",
-        f"전체: {stats['total']}개",
-        f"✅ 완료: {stats['done']}개",
-        f"🟡 부분완료: {stats['partial']}개",
-        f"⏸️ 연기: {stats['deferred']}개",
-        f"❌ 실패: {stats['failed']}개",
-        f"⬜ 미착수: {stats['pending']}개",
-    ]
+    # --- 2. 컨디션 요약 ---
+    condition_summary = ""
+    if conditions:
+        moods = [c.get("mood", "") for c in conditions if c.get("mood")]
+        energies = [c.get("energy_level", 0) for c in conditions if c.get("energy_level")]
+        if energies:
+            avg_energy = sum(energies) / len(energies)
+            condition_summary = f"\n오늘 평균 에너지: {avg_energy:.1f}/5"
+        if moods:
+            condition_summary += f" | 기분 흐름: {' → '.join(moods)}"
 
-    if stats["total_postpones"] > 0:
-        report_lines.append(f"\n총 미룬 횟수: {stats['total_postpones']}회")
-    if stats["total_fails"] > 0:
-        report_lines.append(f"총 실패 횟수: {stats['total_fails']}회")
+    # --- 3. 내일 할 일 미리보기 ---
+    # 내일 날짜의 태스크가 있는지 확인
+    from datetime import timedelta
+    tomorrow = (datetime.now(ZoneInfo(TIMEZONE)) + timedelta(days=1)).strftime("%Y-%m-%d")
+    all_tasks = await db.get_today_tasks()  # 전체 태스크에서 내일 것 찾기
+    tomorrow_tasks = [t for t in all_tasks if t.get("deadline", "").startswith(tomorrow)]
 
-    # 완료율
-    if stats["total"] > 0:
-        rate = (stats["done"] / stats["total"]) * 100
-        report_lines.append(f"\n📈 완료율: {rate:.0f}%")
+    tomorrow_text = ""
+    if tomorrow_tasks:
+        tomorrow_text = "\n\n내일 할 일:\n" + "\n".join(
+            f"  • {t['title']} ({t.get('deadline', '')})" for t in tomorrow_tasks
+        )
 
-    # 태스크별 상세
-    report_lines.append("\n--- 상세 ---")
-    for t in tasks:
-        emoji = {"done": "✅", "partial": "🟡", "deferred": "⏸️",
-                 "failed": "❌", "pending": "⬜", "in_progress": "🔵"}.get(t["status"], "❓")
-        line = f"{emoji} {t['title']}"
-        if t["postpone_count"] > 0:
-            line += f" (미룸 {t['postpone_count']}회)"
-        if t["fail_count"] > 0:
-            line += f" (실패 {t['fail_count']}회)"
-        report_lines.append(line)
-
-    report_text = "\n".join(report_lines)
-
-    # AI로 코멘트 추가
-    ai_comment = await generate_proactive_message(
-        f"저녁 리뷰 코멘트. 유저 리포트:\n{report_text}\n"
-        f"완료율과 미룸/실패 패턴을 보고 짧게 코멘트. 수치 기반으로.",
-        tasks=stats["tasks"]
+    # --- 4. AI가 종합 코멘트 + 하루 점수 + 동기부여 ---
+    ai_prompt = (
+        f"취침 전 루틴이야. 신님에게 보내는 하루 마무리 메시지를 만들어줘.\n\n"
+        f"오늘 리포트:\n{report_text}{condition_summary}\n"
+        f"내일 예정: {tomorrow_text if tomorrow_text else '아직 없음'}\n\n"
+        f"해야 할 것:\n"
+        f"1. 오늘 하루에 10점 만점 점수를 매겨줘 (완료율 + 컨디션 + 노력 종합)\n"
+        f"2. 짧은 코멘트 (수치 기반, 빈 칭찬 금지)\n"
+        f"3. 내일 할 일이 있으면 알려주고, 준비할 게 있는지도\n"
+        f"4. 동기부여 한마디 (날카롭고 짧게, 클리셰 금지)\n"
+        f"5. 푹 쉬라는 인사\n"
+        f"전체 5줄 이내로."
     )
+    ai_comment = await generate_proactive_message(ai_prompt, tasks=tasks)
 
-    full_report = f"{report_text}\n\n💬 {ai_comment}"
+    full_report = f"{report_text}{condition_summary}{tomorrow_text}\n\n{ai_comment}"
     await _send_bot_message(full_report)
 
     # DB 저장
