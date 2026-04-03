@@ -27,7 +27,7 @@ INTENT_PARSE_PROMPT = """너는 JSON 변환기야. 유저 메시지를 읽고, �
 자연어 응답 절대 금지. 반드시 JSON만 반환해.
 
 가능한 인텐트:
-- add_task: 할 일 등록 {{"intent": "add_task", "title": "...", "deadline": "...", "estimated_minutes": ...}}
+- add_task: 할 일 등록 {{"intent": "add_task", "title": "...", "deadline": "...", "estimated_minutes": ..., "task_type": "one_off/span/recurring", "start_date": "YYYY-MM-DD", "end_date": "YYYY-MM-DD", "recurrence_days": [0,1,...]}}
 - complete_task: 완료 {{"intent": "complete_task", "hint": "..."}}
 - defer_task: 미루기 {{"intent": "defer_task", "hint": "...", "new_time": "..."}}
 - fail_task: 못함 {{"intent": "fail_task", "hint": "..."}}
@@ -51,6 +51,9 @@ INTENT_PARSE_PROMPT = """너는 JSON 변환기야. 유저 메시지를 읽고, �
 - "4시 50분"은 "16:50"이다. 12시간제를 24시간제로 변환해.
 - deadline에 날짜 없이 시간만 말하면 오늘 날짜를 붙여: "{today} HH:MM"
 - "내일"이면 "{tomorrow} HH:MM"
+- 단건 일정은 task_type="one_off".
+- 기간 일정(예: 이번 주 내내, 4/1부터 4/3까지)은 task_type="span"과 start_date/end_date를 채워.
+- 반복 일정(예: 매일, 매주 월수금)은 task_type="recurring"과 recurrence_days를 채워. 0=월, 6=일.
 
 현재 대화 상태: {current_state}
 마지막 봇 질문: {last_bot_question}
@@ -149,6 +152,20 @@ async def _build_context() -> str:
                     f"{t['title']}({t.get('deadline', '미정')})" for t in other_tasks
                 )
             )
+
+    upcoming_tasks = await db.get_upcoming_master_tasks(5)
+    if upcoming_tasks:
+        formatted = []
+        dow_names = ["월", "화", "수", "목", "금", "토", "일"]
+        for task in upcoming_tasks:
+            if task["task_type"] == "recurring":
+                days = ",".join(dow_names[d] for d in task.get("recurrence_days", []))
+                formatted.append(f"{task['title']}(반복:{days or '미정'})")
+            elif task["task_type"] == "span":
+                formatted.append(f"{task['title']}({task['start_date']}~{task['end_date']})")
+            else:
+                formatted.append(f"{task['title']}({task['start_date']})")
+        ctx_parts.append("- 예정 태스크: " + ", ".join(formatted))
 
     # 오늘 DND
     dnd = await db.get_today_dnd()

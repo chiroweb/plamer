@@ -12,6 +12,7 @@ from chiro_bot.config import TIMEZONE
 from chiro_bot.planner import generate_plan, format_plan_text
 
 logger = logging.getLogger(__name__)
+SINGLETON_ROUTINE_LABELS = {"취침", "기상"}
 
 # ============================================================
 # 도구 스키마 (OpenAI function calling 형식)
@@ -31,6 +32,14 @@ TOOL_SCHEMAS = [
                     "deadline": {"type": "string", "description": "마감 (YYYY-MM-DD HH:MM 또는 자연어). 없으면 null"},
                     "estimated_minutes": {"type": "integer", "description": "예상 소요시간(분). 모르면 null"},
                     "preferred_start": {"type": "string", "description": "희망 시작시간 HH:MM. 없으면 null"},
+                    "task_type": {"type": "string", "description": "태스크 유형: one_off/span/recurring"},
+                    "start_date": {"type": "string", "description": "시작일 YYYY-MM-DD. 기간/반복 태스크에 사용."},
+                    "end_date": {"type": "string", "description": "종료일 YYYY-MM-DD. 기간/반복 태스크에 사용."},
+                    "recurrence_days": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "반복 요일 배열. 0=월, 1=화, ..., 6=일",
+                    },
                 },
                 "required": ["title"],
             },
@@ -270,11 +279,16 @@ async def execute_tool(name: str, args: dict) -> str:
                 deadline=args.get("deadline"),
                 estimated_minutes=args.get("estimated_minutes"),
                 preferred_start=args.get("preferred_start"),
+                task_type=args.get("task_type"),
+                start_date=args.get("start_date"),
+                end_date=args.get("end_date"),
+                recurrence_days=args.get("recurrence_days"),
             )
             return json.dumps({
                 "success": True,
                 "task_id": task_id,
                 "title": args["title"],
+                "task_type": args.get("task_type"),
                 "message": f"태스크 '{args['title']}' 등록 완료 (ID: {task_id})",
             }, ensure_ascii=False)
 
@@ -323,6 +337,8 @@ async def execute_tool(name: str, args: dict) -> str:
             tasks = await db.get_today_tasks()
             plan = await db.get_today_plan()
             dnd = await db.get_today_dnd()
+            routines = await db.get_today_routines()
+            upcoming = await db.get_upcoming_master_tasks(5)
             stats = await db.get_task_stats_today()
             now_hm = datetime.now(ZoneInfo(TIMEZONE)).strftime("%H:%M")
             return json.dumps({
@@ -334,6 +350,19 @@ async def execute_tool(name: str, args: dict) -> str:
                 "plan": [{"start": p["start_time"], "end": p["end_time"],
                           "title": p["title"], "status": p.get("task_status", "")}
                          for p in plan],
+                "routines": [{"start_time": r["start_time"], "end_time": r["end_time"],
+                              "label": r["label"]} for r in routines],
+                "upcoming": [{
+                    "title": t["title"],
+                    "task_type": t["task_type"],
+                    "start_date": t["start_date"],
+                    "end_date": t.get("end_date"),
+                    "recurrence_days": (
+                        t.get("recurrence_days")
+                        if isinstance(t.get("recurrence_days"), list)
+                        else json.loads(t.get("recurrence_days") or "[]")
+                    ),
+                } for t in upcoming],
                 "dnd": [{"start": d["start_time"], "end": d["end_time"],
                          "reason": d.get("reason", "")} for d in dnd],
             }, ensure_ascii=False)
@@ -346,26 +375,48 @@ async def execute_tool(name: str, args: dict) -> str:
                 return json.dumps({"success": False, "message": "스케줄 가능한 태스크가 없어요."}, ensure_ascii=False)
             # 임시 저장 (confirm_plan에서 확정)
             await db.update_user_state(flow_data={"pending_plan": plan_slots})
+            await db.update_conversation_state(
+                mode="planning",
+                waiting_for="confirm",
+                subject_type="plan",
+                payload={"pending_plan": plan_slots},
+            )
             plan_text = format_plan_text(plan_slots, tasks)
             return json.dumps({"success": True, "plan_text": plan_text, "slot_count": len(plan_slots)}, ensure_ascii=False)
 
         elif name == "confirm_plan":
-            state = await db.get_user_state()
-            flow_data = state.get("flow_data") or {}
+            state = await db.get_conversation_state()
+            flow_data = state.get("payload") or {}
+            if not flow_data:
+                legacy = await db.get_user_state()
+                flow_data = legacy.get("flow_data") or {}
             plan_slots = flow_data.get("pending_plan", [])
             if not plan_slots:
                 return json.dumps({"success": False, "message": "확정할 플랜이 없어요."}, ensure_ascii=False)
             await db.set_daily_plan(plan_slots)
             await db.update_user_state(flow_data=None)
+            await db.reset_conversation_state()
             return json.dumps({"success": True, "message": "플랜 확정 완료."}, ensure_ascii=False)
 
         elif name == "add_routines":
             routines = args.get("routines", [])
             count = 0
             for r in routines:
-                for day in r["days"]:
-                    await db.add_routine(day, r["start_time"], r["end_time"], r["label"])
-                    count += 1
+                if r["label"] in SINGLETON_ROUTINE_LABELS:
+                    slots = [
+                        {
+                            "day_of_week": day,
+                            "start_time": r["start_time"],
+                            "end_time": r["end_time"],
+                        }
+                        for day in r["days"]
+                    ]
+                    await db.replace_routine_label(r["label"], slots)
+                    count += len(slots)
+                else:
+                    for day in r["days"]:
+                        await db.add_routine(day, r["start_time"], r["end_time"], r["label"])
+                        count += 1
             return json.dumps({
                 "success": True,
                 "registered_count": count,
@@ -409,12 +460,7 @@ async def execute_tool(name: str, args: dict) -> str:
             task = _find_task(tasks, args.get("task_title_hint", ""), ["pending", "in_progress", "deferred"])
             if not task:
                 return json.dumps({"success": False, "message": "삭제할 태스크를 찾지 못했어요.", "tasks": [t["title"] for t in tasks]}, ensure_ascii=False)
-            import aiosqlite
-            from chiro_bot.config import DB_PATH
-            async with aiosqlite.connect(DB_PATH) as conn:
-                await conn.execute("DELETE FROM daily_tasks WHERE id = ?", (task["id"],))
-                await conn.execute("DELETE FROM daily_plan WHERE task_id = ?", (task["id"],))
-                await conn.commit()
+            await db.cancel_task(task["id"])
             return json.dumps({"success": True, "deleted": task["title"]}, ensure_ascii=False)
 
         elif name == "update_task":
@@ -422,21 +468,12 @@ async def execute_tool(name: str, args: dict) -> str:
             task = _find_task(tasks, args.get("task_title_hint", ""), ["pending", "in_progress", "deferred"])
             if not task:
                 return json.dumps({"success": False, "message": "수정할 태스크를 찾지 못했어요."}, ensure_ascii=False)
-            import aiosqlite
-            from chiro_bot.config import DB_PATH
-            updates = []
-            vals = []
-            if args.get("new_title"):
-                updates.append("title = ?"); vals.append(args["new_title"])
-            if args.get("new_deadline"):
-                updates.append("deadline = ?"); vals.append(args["new_deadline"])
-            if args.get("new_estimated_minutes"):
-                updates.append("estimated_minutes = ?"); vals.append(args["new_estimated_minutes"])
-            if updates:
-                vals.append(task["id"])
-                async with aiosqlite.connect(DB_PATH) as conn:
-                    await conn.execute(f"UPDATE daily_tasks SET {', '.join(updates)} WHERE id = ?", vals)
-                    await conn.commit()
+            await db.update_task_instance_and_master(
+                task["id"],
+                title=args.get("new_title"),
+                deadline=args.get("new_deadline"),
+                estimated_minutes=args.get("new_estimated_minutes"),
+            )
             return json.dumps({"success": True, "updated": task["title"], "changes": {k: v for k, v in args.items() if k != "task_title_hint"}}, ensure_ascii=False)
 
         elif name == "set_reminder":

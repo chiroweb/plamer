@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """templates.py — 모든 유저 대면 메시지를 생성하는 엔진.
 AI가 아닌 코드가 메시지를 만든다. 페르소나 규칙은 여기에 하드코딩된다."""
 
@@ -8,9 +10,20 @@ from datetime import datetime
 # 아침
 # ============================================================
 
-def morning_greeting(affirmation: str) -> str:
+def morning_greeting(
+    affirmation: str,
+    briefing_lines: list[str] | None = None,
+    ask_condition: bool = True,
+) -> str:
     """아침 시작 메시지. affirmation은 AI가 생성한 오늘의 확언."""
-    return f"좋은 아침이에요. 오늘의 한마디: {affirmation}\n오늘 뭐 하실 거예요?"
+    lines = [f"좋은 아침이에요. 오늘의 한마디: {affirmation}"]
+    if briefing_lines:
+        lines.extend(briefing_lines)
+    if ask_condition:
+        lines.append("오늘 컨디션은 어때요? 오늘 뭐 하실 거예요?")
+    else:
+        lines.append("오늘 뭐 하실 거예요?")
+    return "\n".join(lines)
 
 # ============================================================
 # 태스크 수집 질문 (한 번에 하나만)
@@ -138,7 +151,7 @@ def partial_complete(progress: int, remaining_minutes: int) -> str:
 # 에스컬레이션 (미응답)
 # ============================================================
 
-def escalation_message(level: int, task_context: str = None) -> str:
+def escalation_message(level: int, task_context: str = None, attempt_count: int | None = None) -> str:
     """미응답 에스컬레이션. level = 0~3+"""
     if level == 0:
         return "혹시 메시지 못 보셨나요? 오늘 계획 같이 잡아요."
@@ -149,7 +162,8 @@ def escalation_message(level: int, task_context: str = None) -> str:
             return f"지금 {task_context} 솔직히 말할게요, 지금 안 잡으면 나중에 더 몰려요."
         return "아직 답이 없어요. 1분만 써서 답 주세요."
     else:  # 3+
-        return "솔직히 말할게요. 지금 4번째 알림이에요. 오늘 이걸 안 하면 내일은 더 힘들어져요. 지금 1분만 써서 답 주세요."
+        ordinal = attempt_count if attempt_count and attempt_count >= 4 else 4
+        return f"솔직히 말할게요. 지금 {ordinal}번째 알림이에요. 오늘 이걸 안 하면 내일은 더 힘들어져요. 지금 1분만 써서 답 주세요."
 
 # ============================================================
 # 마감 임박
@@ -248,6 +262,14 @@ def task_added(task_title: str, deadline: str = None) -> str:
 
 def routine_added(label: str, time_range: str) -> str:
     return f"{label} 루틴 등록했어요. {time_range}."
+
+
+def routines_added(routines: list[dict]) -> str:
+    parts = [
+        f"{routine['label']} {routine['start_time']}~{routine['end_time']}"
+        for routine in routines
+    ]
+    return "루틴 등록했어요. " + ", ".join(parts) + "."
 
 def reminder_set(time: str, message: str) -> str:
     return f"{time}에 알려드릴게요."

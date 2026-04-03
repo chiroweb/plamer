@@ -11,6 +11,11 @@ from zoneinfo import ZoneInfo
 
 from telegram import Bot
 
+from chiro_bot.architecture.policy import (
+    classify_message_purpose,
+    is_escalation_eligible_message,
+    should_reset_escalation_for_new_day,
+)
 from chiro_bot.config import (
     TELEGRAM_BOT_TOKEN,
     TELEGRAM_CHAT_ID,
@@ -23,6 +28,7 @@ from chiro_bot import database as db
 from chiro_bot import templates
 from chiro_bot.ai_client import generate_affirmation, generate_evening_comment
 from chiro_bot.patterns import update_patterns
+from chiro_bot.planner import generate_plan
 
 logger = logging.getLogger(__name__)
 
@@ -71,10 +77,25 @@ async def _send(text: str) -> None:
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
     await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
     await db.log_message("bot", text)
+    sent_at = datetime.now(ZoneInfo(TIMEZONE)).isoformat()
+    purpose = classify_message_purpose(text)
     await db.update_user_state(
-        last_bot_message_at=datetime.now(ZoneInfo(TIMEZONE)).isoformat(),
+        last_bot_message_at=sent_at,
     )
-
+    updates = {}
+    if is_escalation_eligible_message(text):
+        updates["last_prompt_requiring_response_at"] = sent_at
+        updates["last_prompt_purpose"] = purpose.value
+    if purpose.value == "morning_briefing":
+        updates["last_morning_at"] = sent_at
+    elif purpose.value == "evening_review":
+        updates["last_evening_review_at"] = sent_at
+    elif purpose.value == "bedtime_notice":
+        updates["last_bedtime_at"] = sent_at
+    elif purpose.value == "system_healthcheck":
+        updates["healthcheck_sent_at"] = sent_at
+    if updates:
+        await db.update_proactive_state(**updates)
 
 # ------------------------------------------------------------------
 # Helpers
@@ -101,21 +122,28 @@ def _parse_deadline(dl_str: str | None, now: datetime) -> datetime | None:
 
 async def _should_escalate(now: datetime) -> bool:
     """True when the user hasn't replied and the escalation interval has elapsed."""
-    last_bot = await db.get_last_bot_message_time()
-    if not last_bot:
+    state = await db.get_proactive_state()
+    last_prompt = state.last_prompt_requiring_response_at
+    if not last_prompt or not state.last_prompt_purpose:
         return False
-    if last_bot.tzinfo is None:
-        last_bot = last_bot.replace(tzinfo=ZoneInfo(TIMEZONE))
+
+    if last_prompt.tzinfo is None:
+        last_prompt = last_prompt.replace(tzinfo=ZoneInfo(TIMEZONE))
+
     last_user = await db.get_last_user_message_time()
     if last_user:
         if last_user.tzinfo is None:
             last_user = last_user.replace(tzinfo=ZoneInfo(TIMEZONE))
-        if last_user > last_bot:
+        if last_user > last_prompt:
             return False
-    state = await db.get_user_state()
-    level = state.get("escalation_level", 0)
+
+    if should_reset_escalation_for_new_day(last_prompt, now):
+        await db.reset_no_response()
+        return False
+
+    level = state.escalation_level
     interval = ESCALATION_INTERVALS.get(level, ESCALATION_INTERVALS[3])
-    elapsed = (now - last_bot).total_seconds() / 60
+    elapsed = (now - last_prompt).total_seconds() / 60
     return elapsed >= interval
 
 
@@ -203,6 +231,60 @@ async def _build_evening_data() -> tuple[list[dict], int, str | None]:
     return tasks_summary, completion_rate, pattern_comment
 
 
+async def _ensure_morning_plan() -> list[dict]:
+    plan = await db.get_today_plan()
+    if plan:
+        return plan
+
+    tasks = await db.get_today_tasks()
+    plannable = [t for t in tasks if t["status"] in ("pending", "deferred")]
+    if not plannable:
+        return []
+
+    dnd = await db.get_today_dnd()
+    routines = await db.get_today_routines()
+    plan_slots = await generate_plan(tasks, dnd, routines)
+    if not plan_slots:
+        return []
+
+    await db.set_daily_plan(plan_slots)
+    return await db.get_today_plan()
+
+
+async def _build_morning_briefing() -> tuple[list[str], bool]:
+    tasks = await db.get_today_tasks()
+    routines = await db.get_today_routines()
+    plan = await _ensure_morning_plan()
+    conditions = await db.get_today_conditions()
+
+    lines: list[str] = []
+
+    if plan:
+        lines.append("오늘 일정:")
+        for slot in plan[:3]:
+            lines.append(f"{slot['start_time']}~{slot['end_time']} {slot['title']}")
+        if len(plan) > 3:
+            lines.append(f"외 {len(plan) - 3}개 더 있어요.")
+    elif tasks:
+        pending = [t for t in tasks if t["status"] in ("pending", "deferred", "in_progress")]
+        if pending:
+            summary = ", ".join(t["title"] for t in pending[:3])
+            if len(pending) > 3:
+                summary += f" 외 {len(pending) - 3}개"
+            lines.append(f"오늘 할 일: {summary}")
+
+    if routines:
+        routine_summary = ", ".join(
+            f"{routine['start_time']}~{routine['end_time']} {routine['label']}"
+            for routine in routines[:2]
+        )
+        if len(routines) > 2:
+            routine_summary += f" 외 {len(routines) - 2}개"
+        lines.append(f"오늘 루틴: {routine_summary}")
+
+    return lines, not bool(conditions)
+
+
 # ------------------------------------------------------------------
 # Main cascade
 # ------------------------------------------------------------------
@@ -218,6 +300,7 @@ async def proactive_check() -> None:  # noqa: C901
     # ================================================================
     if hour == MORNING_HOUR - 1 and minute < 15:
         if not await db.is_healthcheck_sent_today():
+            await db.reset_no_response()
             await _send(templates.healthcheck())
             await db.log_healthcheck()
             try:
@@ -241,8 +324,10 @@ async def proactive_check() -> None:  # noqa: C901
     # ================================================================
     if hour == MORNING_HOUR and minute < 20 and not _flag("morning", now):
         await db.load_dnd_defaults_for_today()
+        await db.reset_no_response()
         affirmation = await generate_affirmation()  # sole AI call
-        await _send(templates.morning_greeting(affirmation))
+        briefing_lines, ask_condition = await _build_morning_briefing()
+        await _send(templates.morning_greeting(affirmation, briefing_lines, ask_condition))
         _mark("morning", now)
         return
 
@@ -251,6 +336,7 @@ async def proactive_check() -> None:  # noqa: C901
     # ================================================================
     if hour == EVENING_HOUR and minute < 20 and not _flag("evening", now):
         tasks_summary, completion_rate, pattern_comment = await _build_evening_data()
+        await db.reset_no_response()
         await _send(templates.evening_review(tasks_summary, completion_rate, pattern_comment))
         await db.archive_today()
         _mark("evening", now)
@@ -260,6 +346,7 @@ async def proactive_check() -> None:  # noqa: C901
     # Step 3.5: Bedtime  (BEDTIME_HOUR, once daily)
     # ================================================================
     if hour == BEDTIME_HOUR and minute < 20 and not _flag("bedtime", now):
+        await db.reset_no_response()
         await _send(templates.bedtime())
         try:
             await update_patterns()
@@ -287,8 +374,10 @@ async def proactive_check() -> None:  # noqa: C901
     # Step 5: Escalation  (DND 직후 — important)
     # ================================================================
     if await _should_escalate(now):
-        state = await db.get_user_state()
-        level = state.get("escalation_level", 0)
+        state = await db.get_proactive_state()
+        user_state = await db.get_user_state()
+        level = state.escalation_level
+        attempt_count = (user_state.get("no_response_count") or 0) + 1
 
         # Build optional task context string
         task_context: str | None = None
@@ -297,7 +386,7 @@ async def proactive_check() -> None:  # noqa: C901
         if active:
             task_context = active[0]["title"]
 
-        await _send(templates.escalation_message(level, task_context))
+        await _send(templates.escalation_message(level, task_context, attempt_count))
         await db.bump_no_response()
         return
 

@@ -12,7 +12,15 @@ from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.cron import CronTrigger
 
 from chiro_bot.config import TELEGRAM_BOT_TOKEN, PROACTIVE_INTERVAL_MINUTES, TIMEZONE
-from chiro_bot.database import init_db, get_today_tasks, get_today_plan, get_today_dnd, get_task_stats_today
+from chiro_bot.database import (
+    init_db,
+    get_today_tasks,
+    get_today_plan,
+    get_today_dnd,
+    get_task_stats_today,
+    get_today_routines,
+    get_upcoming_master_tasks,
+)
 from chiro_bot.handlers import (
     handle_message, start_plan_flow,
     cmd_ideas, cmd_routines, cmd_patterns,
@@ -69,9 +77,11 @@ async def cmd_status(update, context):
     """현재 진행 상태 요약"""
     stats = await get_task_stats_today()
     plan = await get_today_plan()
+    routines = await get_today_routines()
+    upcoming = await get_upcoming_master_tasks(5)
     now_hm = datetime.now(ZoneInfo(TIMEZONE)).strftime("%H:%M")
 
-    if stats["total"] == 0:
+    if stats["total"] == 0 and not routines and not upcoming:
         await update.message.reply_text("오늘 등록된 태스크가 없어요.")
         return
 
@@ -81,6 +91,23 @@ async def cmd_status(update, context):
         f"전체: {stats['total']}개 | 완료: {stats['done']} | 진행중: {stats['in_progress']} | 대기: {stats['pending']}",
         f"완료율: {rate:.0f}%",
     ]
+
+    if routines:
+        lines.append("\n📅 오늘 루틴:")
+        for routine in routines:
+            lines.append(f"  {routine['start_time']}~{routine['end_time']} {routine['label']}")
+
+    if upcoming:
+        dow_names = ["월", "화", "수", "목", "금", "토", "일"]
+        lines.append("\n🗓️ 예정 태스크:")
+        for task in upcoming:
+            if task["task_type"] == "recurring":
+                days = ",".join(dow_names[d] for d in task.get("recurrence_days", []))
+                lines.append(f"  {task['title']} (반복: {days or '미정'})")
+            elif task["task_type"] == "span":
+                lines.append(f"  {task['title']} ({task['start_date']}~{task.get('end_date')})")
+            else:
+                lines.append(f"  {task['title']} ({task['start_date']})")
 
     if stats["total_postpones"] > 0:
         lines.append(f"미룬 횟수: {stats['total_postpones']}회")
